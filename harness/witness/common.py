@@ -1,6 +1,7 @@
 """Shared setup for B1: determinism, corpus slices, spec presets."""
 import hashlib
 import os
+import sys
 from dataclasses import replace
 
 import numpy as np
@@ -17,6 +18,9 @@ DEVICE = os.environ.get("ZK_DEVICE", "cpu")
 TEXT = os.path.join(HERE, "text.txt")
 THREADS = int(os.environ.get("ZK_THREADS", 4))
 CHUNK = 512
+# The recorded runs read the first 40 chunks of the eval window; a longer
+# prompt keeps more tokens of the same window, never a different one.
+EVAL_TOKENS = int(os.environ.get("ZK_EVAL_TOKENS", 40 * CHUNK))
 
 # The three specs B1 has to compare, plus probes that isolate one choice each.
 SPECS = {
@@ -279,12 +283,17 @@ def setup():
 
 def tokens():
     """Eval tokens and a disjoint calibration slice of the same corpus."""
-    cache = os.path.join(OUT, "tokens.npz")
+    # A longer slice gets its own file, so no other caller reads it unasked.
+    name = "tokens.npz" if EVAL_TOKENS == 40 * CHUNK else f"tokens_{EVAL_TOKENS}.npz"
+    cache = os.path.join(OUT, name)
     if not os.path.exists(cache):
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(MODEL)
         text = open(TEXT, encoding="utf-8").read()
-        ev = np.array(tok(text[10_000:200_000]).input_ids[:40 * CHUNK], dtype=np.int64)
+        ev = np.array(tok(text[10_000:200_000]).input_ids[:EVAL_TOKENS], dtype=np.int64)
+        if len(ev) < EVAL_TOKENS:
+            sys.exit(f"the corpus window tokenizes to {len(ev)} tokens and ZK_EVAL_TOKENS "
+                     f"asks for {EVAL_TOKENS}; a longer window is a decision, not a default")
         cal = np.array(tok(text[400_000:440_000]).input_ids[:4 * CHUNK], dtype=np.int64)
         np.savez(cache, eval=ev, calib=cal)
     z = np.load(cache)

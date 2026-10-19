@@ -36,7 +36,7 @@ from .ppl import attention_scales
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--prefix", type=int, default=16384,
-                   help="committed KV prefix, the manifest's `c` (a power of two)")
+                   help="committed KV prefix, the manifest's `c` (whole prefill chunks)")
     p.add_argument("--new", type=int, default=512, help="tokens decoded greedily")
     # The corpus opens with front matter (a preface and a list of illustrations),
     # and a 4,096-token prompt taken from token 0 ends inside that list -- the
@@ -49,14 +49,15 @@ if __name__ == "__main__":
     p.add_argument("--spec", default="b10-design")
     p.add_argument("--out", required=True, help="the ids (.npy); a `.json` note beside it")
     a = p.parse_args()
-    assert a.prefix > 0 and (a.prefix & (a.prefix - 1)) == 0, "prefix must be a power of two"
+    assert a.prefix > 0, "prefix must be positive"
     assert a.prefix % a.chunk == 0, "prefix must be a whole number of prefill chunks"
     setup()
     spec = SPECS[a.spec]
     m = Model(MODEL, spec, attn_scales=attention_scales(spec))
     ev, _ = tokens()
     need = a.offset + a.prefix
-    assert len(ev) >= need, f"the corpus has {len(ev)} tokens, need {need}"
+    assert len(ev) >= need, \
+        f"the corpus has {len(ev)} tokens, need {need}; ZK_EVAL_TOKENS widens the slice"
     prompt = ev[a.offset:need]
 
     t0 = time.time()
