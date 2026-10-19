@@ -47,7 +47,8 @@ own, named where it lives.
     ao_rem_bits        `bits(2 * max_{h,t} (zz[h,t] <<              layer.rs
                        max(jo[t] - min_j jv[h,j], 0)))`, which is   `rem_bits`
                        what `harness/witness/shapes.py` already
-                       reads for the chunk loop's pin.
+                       reads for the chunk loop's pin.  With
+                       `--ao-rem-bits`, that pin.                   cli.rs
     ao_q_bits          `attn_out_bits - 1`, the fold's target       cli.rs
                        width minus one.                             `params_of`
     ao_jo_min/max      the extremes of `jo.i32`, the attention      manifest
@@ -265,18 +266,24 @@ def _check_derived(d, h, nh, s, c, got, name):
     assert not bad, f"{name}: head {h} disagrees with the recomputed shifts on {bad} entries"
 
 
-def fields_of(d, numbits=9, tight=True, table_bits=0, check_derived=False):
+def fields_of(d, numbits=9, tight=True, table_bits=0, check_derived=False,
+              ao_rem_bits=0):
     """One dump's row: the witness-calibrated fields, and what they were read off.
 
-    `numbits`, `tight` and `table_bits` are the run's own command line, because
-    `nmax` and the master table's size are decided there as well as by the
-    witness.  `tight` is `--tight-table` at slack 0, which is what every
-    campaign at this context passes.
+    `numbits`, `tight`, `table_bits` and `ao_rem_bits` are the run's own command
+    line, because `nmax`, the master table's size and the remainder's width are
+    decided there as well as by the witness.  `tight` is `--tight-table` at
+    slack 0, which is what every campaign at this context passes.  `ao_rem_bits`
+    is a chunk loop's shared pin; one below the dump's own is refused.
     """
     man = _man(d)
     r = shapes.shape_of(d)
     ao = man["attn_out"]
     rem = r["ao_rem_bits"]
+    if ao_rem_bits:
+        if int(ao_rem_bits) < rem:
+            raise SystemExit(f"--ao-rem-bits {ao_rem_bits} is below this witness's {rem}")
+        rem = int(ao_rem_bits)
     limbs = accumulator_limbs(man, rem)
     before = man["master_table_bits"]
     row = dict(
@@ -298,6 +305,8 @@ def fields_of(d, numbits=9, tight=True, table_bits=0, check_derived=False):
     )
     row.update(limbs)
     row["fold_rem_bits"], row["fold_alpha"] = fold_pins(man)
+    row["ao_rem_bits_from"] = (f"--ao-rem-bits {ao_rem_bits}" if ao_rem_bits
+                               else "the dump's own rem_bits")
     if table_bits:
         row["log_table"] = int(table_bits)
         row["log_table_from"] = f"--table-bits {table_bits}"
@@ -374,11 +383,11 @@ def summary(doc):
 
 
 def build(base, layers, numbits=9, tight=True, table_bits=0, check_derived=False,
-          dump=None, head_groups=None, absent=()):
+          dump=None, head_groups=None, absent=(), ao_rem_bits=0):
     rows = {}
     absent = sorted(set(int(k) for k in absent))
     if dump:
-        r = fields_of(dump, numbits, tight, table_bits, check_derived)
+        r = fields_of(dump, numbits, tight, table_bits, check_derived, ao_rem_bits)
         rows[str(r["layer"])] = r
     else:
         for k in range(layers):
@@ -389,7 +398,8 @@ def build(base, layers, numbits=9, tight=True, table_bits=0, check_derived=False
             d = f"{base}_L{k}"
             if not os.path.exists(os.path.join(d, "manifest.json")):
                 raise SystemExit(f"{d}: no dump there")
-            rows[str(k)] = fields_of(d, numbits, tight, table_bits, check_derived)
+            rows[str(k)] = fields_of(d, numbits, tight, table_bits, check_derived,
+                                     ao_rem_bits)
             print(f"  L{k:<3} log_table {rows[str(k)]['log_table']:>3} "
                   f"(of {rows[str(k)]['master_table_bits']})  kmax "
                   f"{rows[str(k)]['kmax']:>3}  ao_rem_bits "
@@ -405,11 +415,12 @@ def build(base, layers, numbits=9, tight=True, table_bits=0, check_derived=False
                absent=absent,
                read_by="harness/eval/predict/witness_fields.py",
                # the run's own command line, beside the dump's fields: `nmax`,
-               # the master table's size and how the heads are grouped into key
-               # tiles are the prover's flags and a reader of the file should not
-               # have to find the driver to learn which ones these rows are for
+               # the master table's size, the loop's remainder pin and how the
+               # heads are grouped into key tiles are the prover's flags and a
+               # reader of the file should not have to find the driver to learn
+               # which ones these rows are for
                knobs=dict(numbits=numbits, tight_table=bool(tight),
-                          table_bits=int(table_bits),
+                          table_bits=int(table_bits), ao_rem_bits=int(ao_rem_bits),
                           head_groups=list(head_groups) if head_groups else None),
                witness_fields=list(WITNESS_FIELDS), row_fields=list(ROW_FIELDS))
     doc["summary"] = summary(doc)
@@ -583,6 +594,20 @@ def selftest():
         pinned = fields_of(d, numbits=9, table_bits=21)
         if pinned["log_table"] != 21:
             bad.append("--table-bits does not pin the table")
+        # --ao-rem-bits pins the remainder, and the row says so
+        own = row["ao_rem_bits"]
+        if row["ao_rem_bits_from"] != "the dump's own rem_bits":
+            bad.append("an unpinned row does not say its width is the dump's own")
+        at_pin = fields_of(d, numbits=9, ao_rem_bits=own + 3)
+        if at_pin["ao_rem_bits"] != own + 3:
+            bad.append("--ao-rem-bits does not pin the remainder")
+        if at_pin["ao_rem_bits_from"] != f"--ao-rem-bits {own + 3}":
+            bad.append("a pinned row does not say where its width came from")
+        try:
+            fields_of(d, numbits=9, ao_rem_bits=own - 1)
+            bad.append("a pin below the dump's own was accepted")
+        except SystemExit:
+            pass
         # (3) the rules that are one line of the prover each
         if row["kmax"] != 19:
             bad.append(f"kmax is {row['kmax']} and the dump's worst case is 19")
@@ -608,8 +633,23 @@ def selftest():
             bad.append("the segment built from this row counts no cells")
         if any(m["variant"] == "fold" for m in p["mats"]):
             bad.append("a `b10-final` row left a matmul on the fold")
+        # at the pin, the segment builds the pin's range table, five cells a row
+        q = ec.segment_params("layer", d=5120, nh=40, nkv=8, hd=128, dff=13824,
+                              vocab=152064, s=512, c=4096,
+                              witness=witness_block(at_pin), head_groups=[16, 16, 8])
+        q["mats"] = mats_of(at_pin, q["mats"])
+        tabs, tabs_pin = ec.table_rows(p), ec.table_rows(q)
+        if (f"range{own}" not in tabs or f"range{own}" in tabs_pin
+                or f"range{own + 3}" not in tabs_pin):
+            bad.append("the pinned segment does not build the pin's range table")
+        if (ec.cells_of(q)["fresh"] - got_cells["fresh"]
+                != 5 * ((1 << (own + 3)) - (1 << own))):
+            bad.append("the pin does not move the count by five cells a row")
         # (5) the file, and what reading it back refuses
         doc = build(None, 0, dump=d)
+        pinned_doc = build(None, 0, dump=d, ao_rem_bits=own + 3)
+        if doc["knobs"]["ao_rem_bits"] != 0 or pinned_doc["knobs"]["ao_rem_bits"] != own + 3:
+            bad.append("the file's knobs do not carry the remainder pin")
         f = os.path.join(t, "fields.json")
         with open(f, "w") as fh:
             json.dump(doc, fh, indent=1, sort_keys=True)
@@ -654,8 +694,8 @@ def selftest():
         print("FAIL:", b)
     print(f"witness_fields selftest: {'FAILED' if bad else 'ok'} -- the key max against a "
           f"brute force over every visible entry, the three ways the table size is "
-          f"decided, the per-field rules, the file's refusals, and the stated block a "
-          f"synthetic segment is counted at")
+          f"decided, the remainder pin, the per-field rules, the file's refusals, and "
+          f"the stated block a synthetic segment is counted at")
     return 1 if bad else 0
 
 
@@ -673,6 +713,9 @@ def main(argv=None):
                     help="the master table is the size the dump asks for")
     ap.add_argument("--table-bits", type=int, default=0,
                     help="the run's `--table-bits`, which pins the table instead")
+    ap.add_argument("--ao-rem-bits", type=int, default=0,
+                    help="the chunk loop's `--ao-rem-bits`, which pins the "
+                         "remainder instead of the dump's own width")
     ap.add_argument("--check-derived", action="store_true",
                     help="compare the recomputed shifts against the dump's own "
                          "`dd.i32`, where it was not written with --slim")
@@ -722,7 +765,7 @@ def main(argv=None):
         ab = [int(x) for x in a.absent.split(",") if x != ""] if a.absent else ()
         doc = build(a.dir, a.layers, numbits=a.numbits, tight=a.tight,
                     table_bits=a.table_bits, check_derived=a.check_derived,
-                    dump=a.dump, head_groups=hg, absent=ab)
+                    dump=a.dump, head_groups=hg, absent=ab, ao_rem_bits=a.ao_rem_bits)
     print()
     for f, v in doc["summary"].items():
         if v["min"] != v["max"]:
