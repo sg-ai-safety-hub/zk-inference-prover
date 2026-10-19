@@ -65,8 +65,8 @@ on both backends before it merges. A change that alters the proof records the
 new digests here, in the same pull request, and says why. The digest is
 `result.point.proof_sha256` in the JSON the binary prints on stdout.
 
-The scripts that run this are in `tools/gate/`: one ships a tree to a GPU box,
-one runs the gate there, one prepares a fresh box. The gate builds both
+The scripts that run this are in `tools/gate/`: one ships a tree to a GPU host,
+one runs the gate there, one prepares a fresh host. The gate builds both
 backends, generates and installs the kernels for the synthetic shapes in
 between, checks that the vendored library was really built for the card it is
 about to use, and runs the test suite on each backend. Any CUDA card runs it;
