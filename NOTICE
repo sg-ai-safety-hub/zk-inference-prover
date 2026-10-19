@@ -1,0 +1,7 @@
+zk-prover
+Copyright 2026 Pascal Berrang
+
+This product includes NitrooZK-stwo
+(https://github.com/AntChainOpenLabs/NitrooZK-stwo), vendored in nitroo/,
+Copyright 2024 StarkWare Industries Ltd., licensed under the Apache License,
+Version 2.0. See nitroo/LICENSE.
