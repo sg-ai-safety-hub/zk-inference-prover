@@ -934,11 +934,60 @@ fn calibration_of_args(args: &[String], p: &compose::Params)
     Some(shaperoot::calibration_of_doc(&f, &v, p).unwrap_or_else(|e| panic!("--calibration {e}")))
 }
 
+/// The table width the line or the manifest states, in bits; 0 when neither names one.
+fn stated_table_bits(src: &Src) -> u32 {
+    match (src.log_table, &src.dir) {
+        (0, Some(dir)) => witread::read_manifest(dir)
+            .ok()
+            .and_then(|m| m["master_table_bits"].as_u64())
+            .unwrap_or(0) as u32,
+        (n, _) => n,
+    }
+}
+
+/// The commands that build a layer only to read its `Params`.
+fn lowering(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some("cudaemit") | Some("genemit"))
+}
+
+/// Under `--tight-table`, a lowering command loads once at a 16-row table to
+/// learn the keys' width and once more at that width; every row of the table
+/// is a function of its own index, so this is the layer `tighten_of` would
+/// cut the wide one into.
 pub fn layer_of(args: &[String]) -> (layer::Layer, String) {
+    if lowering(args)
+        && flag(args, "--tight-table")
+        && !flag(args, "--weights-only")
+        && !flag(args, "--calibration")
+        && !flag(args, "--frac-per-head")
+        && !flag(args, "--synth-residual-stream") // its rotation sizes the table off the key tiles
+    {
+        let slack: i32 = arg_scalar(args, "--tight-table", 0i32);
+        let stated = stated_table_bits(&src_of(args));
+        if slack >= 0 && stated > 0 {
+            eprintln!("tight-table: probe load at a 16-row table");
+            let (probe, _) = layer_at(args, Some(4), false);
+            let (need, key_tiles) = (probe.key_bits(), probe.key_tiles.len());
+            drop(probe);
+            let width = ((need as i32 + slack).max(1) as u32).min(stated);
+            eprintln!("tight-table: {key_tiles} key tiles, the keys need 2^{need} rows; \
+loading at 2^{width}, stated 2^{stated}");
+            return layer_at(args, Some(width), true);
+        }
+    }
+    layer_at(args, None, true)
+}
+
+/// The layer a command line names, at `table_bits` rows when given; `finish`
+/// applies `--tight-table` and the coordinate.
+fn layer_at(args: &[String], table_bits: Option<u32>, finish: bool) -> (layer::Layer, String) {
     let vname = arg_strs(args, "--variants", &["intsplit6"])[0].clone();
     let variant = attention::witness::Variant::parse(&vname);
     let head_groups = arg_list(args, "--head-groups", &[8usize, 4, 2]);
-    let src = src_of(args);
+    let src = match table_bits {
+        Some(b) => Src { log_table: b, ..src_of(args) },
+        None => src_of(args),
+    };
     // Issue #112: the parameter-only load, before the dump's -- the statement
     // and the calibration, and no dump on disk. It derives the **shape** root:
     // it holds no model, so the model tree it would commit is a tree of
@@ -1036,8 +1085,10 @@ pub fn layer_of(args: &[String]) -> (layer::Layer, String) {
                         *x = p.ao_jo_min;
                     }
                 }
-                tighten_of(&mut l, args);
-                coord_of(&mut l, args);
+                if finish {
+                    tighten_of(&mut l, args);
+                    coord_of(&mut l, args);
+                }
                 return (l, vname);
             }
             Err(e) => {
@@ -1075,8 +1126,10 @@ pub fn layer_of(args: &[String]) -> (layer::Layer, String) {
         l.synth_head(src.seed, arg_scalar(args, "--residual-stream-a", 32usize), round,
                      arg_scalar(args, "--synth-vocab", 256usize));
     }
-    tighten_of(&mut l, args);
-    coord_of(&mut l, args);
+    if finish {
+        tighten_of(&mut l, args);
+        coord_of(&mut l, args);
+    }
     (l, vname)
 }
 
@@ -3493,6 +3546,48 @@ mod pinned_exp_table {
         let msg = *why.downcast::<String>()
             .expect("the refusal says which --table-bits to pass");
         assert!(msg.contains(&format!("pass --table-bits {TABLE_BITS}")), "{msg}");
+    }
+}
+
+/// The two-load path of `layer_of`.
+#[cfg(test)]
+mod lowering_load {
+    use super::{layer, layer_of, params_of};
+
+    fn line(cmd: &str, shape: &str) -> Vec<String> {
+        format!("{cmd} --tight-table {shape}").split_whitespace().map(str::to_string).collect()
+    }
+    fn widths(l: &layer::Layer) -> Vec<u32> {
+        l.key_tiles.iter().map(|t| t.log_table).collect()
+    }
+
+    /// A lowering line lands on the layer a proving line lands on: the same
+    /// table width on every key tile and the same `Params`.
+    #[test]
+    fn a_lowering_line_lands_on_the_proving_lines_layer() {
+        let shape = "--round away --variants intsplit6 --table-bits 22 --s 32 --ctx 128 --hd 32 \
+--diagonal-block --unsound-skip-residual-stream";
+        let (a, va) = layer_of(&line("cudaemit", shape));
+        let (b, vb) = layer_of(&line("compose", shape));
+        assert!(a.key_bits() < 22, "the keys want the whole stated table, so the probe decides nothing");
+        assert_eq!(widths(&a), widths(&b));
+        let pa = serde_json::to_string(&params_of(&a, &line("cudaemit", shape), &va)).unwrap();
+        let pb = serde_json::to_string(&params_of(&b, &line("compose", shape), &vb)).unwrap();
+        assert_eq!(pa, pb);
+    }
+
+    /// A synthetic residual stream rebuilds the key tiles under a rotation that
+    /// sizes the table off them, so a lowering line keeps the single load and
+    /// lands at the width it states.
+    #[test]
+    fn a_synthetic_residual_stream_line_keeps_the_single_load() {
+        let shape = "--round away --variants intsplit6 --table-bits 24 --s 32 --ctx 32 --hd 64 \
+--head-groups 1,1 --nin 128 --nout 128 --qbits 15 --kbits 14 --residual-stream-a 32 --kmax 16 \
+--synth-residual-stream --diagonal-block";
+        let (l, _) = layer_of(&line("cudaemit", shape));
+        assert!(l.rope.is_some(), "this shape wires no rotation, so the test measures nothing");
+        assert_eq!(l.key_bits(), 24);
+        assert!(widths(&l).iter().all(|w| *w == 24), "{:?}", widths(&l));
     }
 }
 

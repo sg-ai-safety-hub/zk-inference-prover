@@ -2,9 +2,11 @@ use std::path::PathBuf;
 fn main() {
     #[cfg(target_os = "macos")]
     std::process::exit(0);
+    // cargo's job count (`-j`, `CARGO_BUILD_JOBS`), exported to build scripts as NUM_JOBS; 16 when unset
+    let jobs: usize = std::env::var("NUM_JOBS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let dst = cmake::Config::new("src/stwo_cuda/cuda")
         .profile("Release")
-        .build_arg("--jobs=16")
+        .build_arg(format!("--jobs={jobs}"))
         .build();
     println!("cargo:rustc-link-search=native={}", dst.display());
     println!("cargo:rustc-link-lib=static=stwo_cuda");
