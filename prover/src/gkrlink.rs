@@ -883,7 +883,7 @@ pub fn ao_looks(plan: &crate::compose::Plan, rels: &crate::compose::Rels)
     let acc_off = SecureField::from(M31::from_u32_unchecked(
         if plan.p.ao_acc_mag { 0 }
         else { 1 << (plan.p.ao_acc_lo_bits + plan.p.ao_acc_hi_bits - 1) }));
-    let ncs = if plan.p.ao_acc_mag { 10 } else { 9 };
+    let ncs = crate::gadgets::attn_out::trace::slot_cols(plan.p.ao_acc_mag, plan.p.ao_acc_prod);
     let mut looks = vec![];
     for sl in 0..lay.per_row {
         // `ao_interaction`'s own indexing: slot `sl` starts at `2 + 9 * sl`,
@@ -937,6 +937,15 @@ pub fn ao_looks(plan: &crate::compose::Plan, rels: &crate::compose::Rels)
                 k: acc_off * inv_lo,
             }),
         });
+        // the product form: `ahn = ahi num`, committed at `c0 + 10`, in its
+        // `30 - lo`-bit table
+        if plan.p.ao_acc_prod {
+            looks.push(LinkLook {
+                num: None,
+                den: range_den(rels.range(crate::compose::ao_prod_bits(&plan.p)),
+                               Affine::col(RCol::Ao(c0 + 10), one)),
+            });
+        }
     }
     vec![SiteLooks { reg: Comp::Ao, which: 0, log_rows: lay.log_rows, looks }]
 }

@@ -67,6 +67,11 @@ pub struct AttnOutEval {
     /// bits and not `acc_bits() + 1`, because the sign is the pin's and not the
     /// offset's -- which is the bit `y-delay-vw12`'s layer 0 is short.
     pub acc_mag: bool,
+    /// The product form (`compose::Params::ao_acc_prod`), on top of the
+    /// magnitude form: the slot commits an eleventh column `ahn`, pinned to
+    /// `ahi num` by a degree-2 constraint and range-checked in this table of
+    /// `30 - acc_lo_bits` bits.  `None` in the other two forms.
+    pub rel_acc_prod: Option<RangeRel>,
     /// Stream TT (E11), log row 73: the sibling bound's half.  `denp`'s own
     /// range check is on `2 denp` instead, which states `denp <= 2^(rem-1) - 1`
     /// -- the width `AttnOut::rem_bits` was derived from -- and buys the bit
@@ -174,6 +179,17 @@ impl FrameworkEval for AttnOutEval {
             if let Some(m) = &amag {
                 eval.add_constraint((m.clone() - acc.clone()) * (m.clone() + acc.clone()));
             }
+            // The product form: `ahn = ahi num`, eleventh and last of the slot.
+            // `ahi` is the high limb the range check below reads, degree 1, and
+            // `num` is the `EPOW` lookup's `2^max(e,0)`, so this is degree 2.
+            // With `ahi < 2^hi` and `num <= 2^e_hi` it cannot wrap
+            // (`hi + e_hi <= 30`, `Plan::new`), so it holds over the integers,
+            // and `ahn` below `2^(30 - lo)` then puts `mag num` below `2^30`.
+            let ahn = self.rel_acc_prod.as_ref().map(|_| eval.next_trace_mask());
+            if let (Some(m), Some(hn)) = (&amag, &ahn) {
+                let ahi = (m.clone() - alo.clone()) * inv_lo;
+                eval.add_constraint(hn.clone() - ahi * num.clone());
+            }
             accs.push(acc.clone());
             eval.add_constraint(sg.clone() * sg.clone() - sg.clone());
             // the sign pin (B6 review, gap 7), as in the standalone gadget
@@ -247,6 +263,11 @@ impl FrameworkEval for AttnOutEval {
                     &self.rel_acc_lo, E::EF::one(), core::slice::from_ref(&alo)));
                 eval.add_to_relation(RelationEntry::new(
                     &self.rel_acc_hi, E::EF::one(), core::slice::from_ref(&ahi)));
+                // the product form's per-slot bound, `ahn < 2^(30 - lo)`
+                if let (Some(rel), Some(hn)) = (&self.rel_acc_prod, &ahn) {
+                    eval.add_to_relation(RelationEntry::new(
+                        rel, E::EF::one(), core::slice::from_ref(hn)));
+                }
             }
         }
 

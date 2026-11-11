@@ -504,7 +504,7 @@ def main():
               f"x{n_rows / max(len(emit), 1):.1f} fewer cudaemit launches)")
 
 
-def _shape_table(d, b, rems, bits=12, acc=None):
+def _shape_table(d, b, rems, bits=12, acc=None, jv=-6, jo=-10):
     """One block's shape table, with only the fields a plan reads.
 
     `bits` is the fold's target width, one value or one per row: a set whose
@@ -518,10 +518,13 @@ def _shape_table(d, b, rems, bits=12, acc=None):
         bits = [bits] * len(rems)
     if not isinstance(acc, list):
         acc = [acc] * len(rems)
+    # the two exponent extremes, one value or one per row, as `acc` is
+    jv = jv if isinstance(jv, list) else [jv] * len(rems)
+    jo = jo if isinstance(jo, list) else [jo] * len(rems)
     rows = [dict(layer=k, block=b, c=512, table_bits=23, ao_rem_bits=rem,
                  attn_out_bits=w, ao_acc_bits=a,
-                 ao_jv_max=(-6 if a else None), ao_jo_min=(-10 if a else None))
-            for k, (rem, w, a) in enumerate(zip(rems, bits, acc))]
+                 ao_jv_max=(v if a else None), ao_jo_min=(o if a else None))
+            for k, (rem, w, a, v, o) in enumerate(zip(rems, bits, acc, jv, jo))]
     with open(os.path.join(d, f"shapes_B{b}.json"), "w") as f:
         json.dump(dict(rows=rows, block=b), f)
 
@@ -717,13 +720,16 @@ def selftest():
         case("a re-extracted table is checked on both halves", ok, last(printed, refusal))
 
         # 11. and a shape whose window half does not fit: refused before the file
-        #    is written, and not by naming a pin, which cannot recover a bit of it
-        _shape_table(d, 1, [15, 16, 20], acc=[19, 19, 27])
+        #    is written, and not by naming a pin, which cannot recover a bit of it.
+        #    A 27-bit accumulator composes in the product form, so what is refused
+        #    here is an exponent window past even that one.
+        _shape_table(d, 1, [15, 16, 20], acc=[19, 19, 27], jv=[-6, -6, -5],
+                     jo=[-10, -10, -20])
         os.remove(out)
         printed, refusal = _plan(args)
         ok = (refusal is not None and refusal.startswith("block 1 layer 2: ")
               and "no-wrap window does not fit" in refusal
-              and "1 + 16 + 11 + 4 = 32 > 31 (over by 1, magnitude form)" in refusal
+              and "1 + max(16, 11) + 15 = 32 > 31 (over by 1, product form)" in refusal
               and "--ao-rem-per-line" not in refusal and not os.path.exists(out))
         case("a window half past the field is refused", ok, last(printed, refusal))
 
@@ -762,13 +768,14 @@ def selftest():
               and "--ao-rem-per-line" not in refusal and not os.path.exists(out))
         case("a head line past the quotient cap is refused", ok, last(printed, refusal))
 
-        # 14. and the half no pin moves: an accumulator one bit past the window
-        #     is refused too, naming neither pin, since neither could recover it
-        _head_dump(d, 1, 512, acc=27)
+        # 14. and the half no pin moves: an exponent window one bit past the
+        #     product form is refused too, naming neither pin, since neither
+        #     could recover it
+        _head_dump(d, 1, 512, acc=27, jv=-5, jo=-20)
         printed, refusal = _plan(args + head + pin23)
         ok = (refusal is not None and refusal.startswith("block 1's head line: ")
               and "no-wrap window does not fit" in refusal
-              and "1 + 16 + 11 + 4 = 32 > 31 (over by 1, magnitude form)" in refusal
+              and "1 + max(16, 11) + 15 = 32 > 31 (over by 1, product form)" in refusal
               and "--head-flags" not in refusal and not os.path.exists(out))
         case("a head line past the window half is refused", ok, last(printed, refusal))
 

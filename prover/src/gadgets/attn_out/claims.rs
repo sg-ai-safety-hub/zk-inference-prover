@@ -152,16 +152,18 @@ pub fn ao_interaction(ao: &AttnOut, r: &AoComponent, rr: SecureField, s_ch: Secu
                         .into_iter().map(crate::device::AnyCol::OwnedHost).collect::<Vec<_>>());
 
     // lookups in AIR order, per slot: the `EPOW` window, (qm, nz2), d, dp,
-    // denp, the offset accumulator's low limb, then its high limb
+    // denp, the offset accumulator's low limb, then its high limb, and in the
+    // product form `ahn = ahi num` last
     let one = PackedQM31::broadcast(SecureField::one());
-    let n_looks = 7 * pr;
+    let lps = r.looks_per_slot();
+    let n_looks = lps * pr;
     let inv_lo = stwo::prover::backend::simd::m31::PackedM31::broadcast(
         M31::from_u32_unchecked(1 << r.acc_lo_bits).inverse());
     let acc_off = stwo::prover::backend::simd::m31::PackedM31::broadcast(
         M31::from_u32_unchecked(r.acc_off() as u32));
     let ncs = r.per_slot();
     let fr = |i: usize, vr: usize| -> (PackedQM31, PackedQM31) {
-        let (s, which) = (i / 7, i % 7);
+        let (s, which) = (i / lps, i % lps);
         let c0 = 2 + ncs * s;
         match which {
             // the window: `(jvp + joff, num, pj)`, `jvp` preprocessed and
@@ -192,6 +194,9 @@ pub fn ao_interaction(ao: &AttnOut, r: &AoComponent, rr: SecureField, s_ch: Secu
             // the no-wrap window's two limbs on `acc + acc_off` -- and, in
             // stream TT's magnitude form, on the committed `|acc|` at `c0 + 9`
             5 => (one, rels.range(r.acc_lo_bits).combine(&[r.base[c0 + 8].data[vr]])),
+            // the product form's per-slot bound
+            7 => (one, rels.range(r.acc_prod.expect("an eighth look is the product form's"))
+                           .combine(&[r.base[c0 + 10].data[vr]])),
             _ => {
                 let v = if r.acc_mag { r.base[c0 + 9].data[vr] }
                         else { r.base[c0].data[vr] + acc_off };
