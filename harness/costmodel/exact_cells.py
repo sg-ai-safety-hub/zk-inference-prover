@@ -377,6 +377,10 @@ def range_widths(p):
     `witness_terms`."""
     w = [p["k_bits"], p["q_bits"], 8, p["z_lo_bits"], p["z_hi_bits"], p["ao_rem_bits"],
          p["ao_acc_lo_bits"], p["ao_acc_hi_bits"]]
+    # the product form's `ahn = ahi num` table, only in that form; the set below
+    # takes it away again wherever another width is already `30 - lo`
+    if p.get("ao_acc_prod"):
+        w.append(ao_prod_bits(p))
     name, k = attn_variant(p)
     if name == "intsplit":
         w.append(k)
@@ -387,6 +391,12 @@ def range_widths(p):
     if p.get("residual_stream"):
         w.append(15)
     return sorted(set(w))
+
+
+def ao_prod_bits(p):
+    """`compose.rs`, `ao_prod_bits`: the product form's range table, `ahn = ahi
+    num` checked below `2^(30 - lo)`."""
+    return max(30 - p["ao_acc_lo_bits"], 0)
 
 
 def e_window(p):
@@ -598,9 +608,14 @@ def exact_cells(p):
     # ---- the attention output
     ao_pr, _, ao_lr = ao_layout(nh, s, hd_v(p), p["ao_target"])
     # `layer.rs`, `ao_component`: the row's `den` and `joff`, then per slot
-    # acc, sg, qm, nz2, denp, d, num, pj, alo -- and `mag` tenth under `acc_mag`
-    ao_cols = 2 + ao_pr * (9 + int(p.get("ao_acc_mag", False)))
-    ao_qm = 5 if p.get("gkr_attnout") else 5 + -(-7 * ao_pr // 2)
+    # acc, sg, qm, nz2, denp, d, num, pj, alo -- and `mag` tenth under `acc_mag`,
+    # and `ahn` eleventh under `acc_prod`, which is built on the magnitude form
+    # (`trace.rs`, `slot_cols`)
+    ao_mag, ao_prod = bool(p.get("ao_acc_mag", False)), bool(p.get("ao_acc_prod", False))
+    assert ao_mag or not ao_prod, "the product form is built on the magnitude form"
+    ao_cols = 2 + ao_pr * (9 + int(ao_mag) + int(ao_prod))
+    # seven lookups per slot, and the product form's `ahn` eighth (`slot_looks`)
+    ao_qm = 5 if p.get("gkr_attnout") else 5 + -(-(7 + int(ao_prod)) * ao_pr // 2)
     comp["attnout"] = (ao_cols << ao_lr, (M31_PER_QM31 * ao_qm) << ao_lr)
 
     # ---- the Freivalds checks, one per group of matmuls sharing an input
@@ -968,8 +983,10 @@ def witness_terms(p):
     out["ao_ranges"] = 5 * ((1 << p["ao_acc_hi_bits"]) + (1 << p["ao_rem_bits"])
                             + (1 << log_rows_for(hi - lo + 1)))
     # the accumulator's low limb and the quantize width, one range table each,
-    # and the pair table the quantize width keys
-    out["ao_acc_lo_bits"] = 5 * (1 << p["ao_acc_lo_bits"])
+    # and the pair table the quantize width keys.  The product form's `ahn`
+    # table is `30 - lo` bits, so the low limb sizes that one too.
+    out["ao_acc_lo_bits"] = 5 * ((1 << p["ao_acc_lo_bits"])
+                                 + ((1 << ao_prod_bits(p)) if p.get("ao_acc_prod") else 0))
     out["ao_q_bits"] = 5 * ((1 << p["ao_q_bits"])
                             + ((1 << (p["ao_q_bits"] + 1)) if p["ao_q_bits"] > 7 else 0))
     # the fold's own remainder range table, on a segment that folds at all
@@ -1582,8 +1599,9 @@ def selftest(argv_points=None):
           f"{', '.join(sorted({p['params']['round'] for p in pts}))}")
     print(f"  {len(red)} reduction configurations, from none of the five to all five")
     print("  a one-cell difference is a failure: checked")
-    return (bound_selftest(pts) or seam_selftest() or builder_selftest()
-            or moe_selftest() or gqa_selftest(pts) or latent_selftest())
+    return (bound_selftest(pts) or seam_selftest() or product_selftest()
+            or builder_selftest() or moe_selftest() or gqa_selftest(pts)
+            or latent_selftest())
 
 
 def bound_selftest(pts):
@@ -1754,6 +1772,70 @@ def seam_selftest():
           "carries three claims,")
     print("  which no recorded segment separates from the other reading: every one "
           "of their seams is even")
+    return 0
+
+
+def product_selftest():
+    """The attention output's product form, which no recorded segment is in.
+
+    `Params::ao_acc_prod` adds three things to the magnitude form's segment: an
+    eleventh column a slot (`ahn = ahi num`), an eighth lookup a slot, and a
+    range table of `30 - lo` bits that `Plan::new` puts in its width SET.  No
+    recorded chunk separates any of them from the magnitude form, so this checks
+    each against the segment they are added to, on the Llama 3.1 8B dump the form
+    was written for: block 0 layer 1 of a 512-token table of contents, whose
+    22-bit accumulator splits 16 + 6 under `jv_max = -5`, `jo_min = -14`, so that
+    the product table is 14 bits.  And where `30 - lo` is a width the segment
+    already registers, the set takes the table away again.
+    """
+    bad = []
+    ref = headline_chunks("layer")[0]["params"]
+    mag = dict(ref, ao_acc_lo_bits=16, ao_acc_hi_bits=6, ao_jv_max=-5, ao_jo_min=-14,
+               ao_acc_mag=True)
+    prod = dict(mag, ao_acc_prod=True)
+    if ao_prod_bits(prod) != 14:
+        bad.append(f"the 16 + 6 split's product table is {ao_prod_bits(prod)} bits "
+                   f"and not 30 - 16 = 14")
+    pr, _, lr = ao_layout(ref["nh"], ref["s"], hd_v(ref), ref["ao_target"])
+    table = 1 << 14
+    if 14 in range_widths(mag) or 14 not in range_widths(prod):
+        bad.append(f"the 14-bit table is not the product form's own: "
+                   f"{range_widths(mag)} against {range_widths(prod)}")
+    # with the attention output's lookups in the batched reduction, which is how
+    # both headline runs prove it, the eighth lookup commits no column; without
+    # it, `8 pr` fractions in pairs where there were `7 pr`
+    for gkr in (True, False):
+        m, q = dict(mag, gkr_attnout=gkr), dict(prod, gkr_attnout=gkr)
+        a, b = exact_cells(m), exact_cells(q)
+        pairs = 0 if gkr else -(-8 * pr // 2) - -(-7 * pr // 2)
+        want = dict(base=(pr << lr) + table,
+                    interaction=((M31_PER_QM31 * pairs) << lr) + M31_PER_QM31 * table,
+                    boundary=0)
+        for field, w in want.items():
+            if b[field] - a[field] != w:
+                bad.append(f"the product form adds {b[field] - a[field]:,} to `{field}` "
+                           f"{'with' if gkr else 'without'} --gkr-attnout, and not "
+                           f"{w:,}")
+        if b["components"]["attnout"][0] - a["components"]["attnout"][0] != pr << lr:
+            bad.append("the product form's column is not one a slot")
+    # a split whose `30 - lo` the segment already carries (15, the requantize
+    # seams' width) registers no table of its own
+    m15 = dict(mag, ao_acc_lo_bits=15, ao_acc_hi_bits=7)
+    if exact_cells(dict(m15, ao_acc_prod=True))["table_rows"] != exact_cells(m15)["table_rows"]:
+        bad.append("a product table of a width already registered was counted twice")
+    try:
+        exact_cells(dict(prod, ao_acc_mag=False))
+        bad.append("a product form not on the magnitude form was counted")
+    except AssertionError:
+        pass
+    for b_ in bad:
+        print("exact cells:", b_)
+    if bad:
+        return 1
+    print(f"  the product form adds one column and one lookup a slot ({pr} slots at "
+          f"2^{lr} rows) and a 14-bit table")
+    print("  to the 8B table of contents' segment, and no table where `30 - lo` is "
+          "already registered: checked")
     return 0
 
 

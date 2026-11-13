@@ -56,11 +56,16 @@ own, named where it lives.
     ao_acc_lo_bits     `params_of`'s two limbs of the committed     cli.rs
     ao_acc_hi_bits     accumulator: the low one takes what it can   `params_of`
     ao_acc_mag         up to 16, the high one the rest, neither     `split`,
-                       below `MIN_LOG_ROWS`.  The offset form       shapes.py
+    ao_acc_prod        below `MIN_LOG_ROWS`.  The offset form       shapes.py
                        needs `acc_bits + 1` and the magnitude       `ao_no_wrap`
                        form `acc_bits`, and the prover takes the
                        magnitude form exactly when
                        `1 + lo + hi + e_hi > 31` refuses the other.
+                       The product form keeps the magnitude form's
+                       limbs and is taken exactly when that window
+                       refuses too, so `ao_acc_mag` is true in it.
+                       A file written before it carries no
+                       `ao_acc_prod`, and reads as false.
     fold_rem_bits      the dump's own fold pins, zero on a dump     cli.rs
     fold_alpha         whose `deq_variants` names no `fold`         `params_of`,
                        matmul -- which every `b10-final` dump is.   layer.rs
@@ -120,9 +125,16 @@ WITNESS_FIELDS = ("log_table", "kmax", "ao_acc_hi_bits", "ao_acc_lo_bits",
 # What is in a row beside those: the fold's second pin, the accumulator form,
 # the two quantize widths, the denominator's floor and the dequantize layout.
 # All of them are the dump's or the run's and none of them is a fit.
-ROW_FIELDS = WITNESS_FIELDS + ("fold_alpha", "ao_acc_mag", "ao_denp2",
+ROW_FIELDS = WITNESS_FIELDS + ("fold_alpha", "ao_acc_mag", "ao_acc_prod", "ao_denp2",
                                "k_bits", "q_bits", "nmax", "z_min",
                                "deq_variants")
+
+# The row fields a file written before them does not carry, and what such a row
+# was counted at.  The product form (`ao_acc_prod`) did not exist when the first
+# files were read, so a row without it is in one of the other two forms and
+# `ao_acc_mag` says which: reading it as false keeps every count made from those
+# files, which is not assuming a field but reading the file as it was written.
+ROW_DEFAULTS = dict(ao_acc_prod=False)
 
 
 def _man(d):
@@ -163,9 +175,10 @@ def fold_pins(man):
 
 
 def accumulator_limbs(man, ao_rem_bits):
-    """`params_of`'s `ao_acc_lo_bits`, `ao_acc_hi_bits`, `ao_acc_mag`, `ao_denp2`.
+    """`params_of`'s `ao_acc_lo_bits`, `ao_acc_hi_bits`, `ao_acc_mag`,
+    `ao_acc_prod`, `ao_denp2`.
 
-    The decision between the two forms is the no-wrap window's, which
+    The decision between the three forms is the no-wrap window's, which
     `harness/witness/shapes.py` already evaluates for the plan writer, so it is
     read from there rather than written twice.  A dump older than the extractor
     that recorded `ao_acc_bits` states no accumulator width, and this refuses
@@ -182,9 +195,12 @@ def accumulator_limbs(man, ao_rem_bits):
             "run that proves it.")
     w = shapes.ao_no_wrap(acc, ao["jv_max"], ao["jo_min"],
                           man.get("attn_out_bits", 8), ao_rem_bits)
+    # the product form is built on the magnitude form's committed `|acc|`, so
+    # `params_of` sets `ao_acc_mag` in it too
     return dict(ao_acc_bits=acc, ao_acc_lo_bits=w["acc_lo_bits"],
                 ao_acc_hi_bits=w["acc_hi_bits"],
-                ao_acc_mag=(w["form"] == "magnitude"),
+                ao_acc_mag=(w["form"] in ("magnitude", "product")),
+                ao_acc_prod=(w["form"] == "product"),
                 ao_denp2=(w["quotient"]["form"] == "denp2"),
                 no_wrap_margin=w["margin"], quotient_margin=w["quotient"]["margin"])
 
@@ -349,11 +365,13 @@ def load(path):
     if not rows:
         raise SystemExit(f"{path}: the document names no layer")
     for k, row in sorted(rows.items()):
-        miss = [f for f in ROW_FIELDS if f not in row]
+        miss = [f for f in ROW_FIELDS if f not in row and f not in ROW_DEFAULTS]
         if miss:
             raise SystemExit(f"{path}: layer {k} states no {', '.join(miss)}. "
                              f"Every field a segment is counted at is read off the "
                              f"dump, and a field that is missing is not assumed here.")
+        for f, v in ROW_DEFAULTS.items():
+            row.setdefault(f, v)
     return doc
 
 
@@ -457,7 +475,8 @@ def synthetic_fields(stated, layers, head_groups=None):
     """
     stated_from = stated.get("stated_from")
     row = {k: v for k, v in stated.items() if k != "stated_from"}
-    miss = [f for f in ROW_FIELDS if f not in row]
+    miss = [f for f in ROW_FIELDS if f not in row and f not in ROW_DEFAULTS]
+    row = dict(ROW_DEFAULTS, **row)
     if miss:
         raise SystemExit(f"the stated block names no {', '.join(miss)}. A synthetic "
                          f"segment has no dump to read them off, so every field it "
@@ -598,6 +617,8 @@ def selftest():
                        f"{row['ao_acc_hi_bits']} and 19 + 1 bits split 16 + 4")
         if row["ao_acc_mag"]:
             bad.append("the offset form fits here and the magnitude form was taken")
+        if row["ao_acc_prod"]:
+            bad.append("the offset form fits here and the product form was taken")
         # (4) a witness block out of it is one `exact_cells` counts a segment at
         p = ec.segment_params("layer", d=5120, nh=40, nkv=8, hd=128, dff=13824,
                               vocab=152064, s=512, c=4096,
@@ -650,12 +671,55 @@ def selftest():
             bad.append("a stated block naming a dump digest was accepted")
         except SystemExit:
             pass
+        # (7) the product form, on the Llama 3.1 8B dump it was written for:
+        # block 0 layer 1 of a 512-token table of contents, whose 22-bit
+        # accumulator the magnitude form refused at `1 + 16 + 6 + 9 = 32`.  Its
+        # row is in the magnitude form AND the product form, the predictor
+        # counts it in the product form, and a row of a file written before the
+        # field existed reads as false and counts what it always did.
+        from harness.eval.predict import predict as pr_
+        toc = dict(man, attn_out=dict(man["attn_out"], ao_acc_bits=22, jv_max=-5,
+                                      jo_min=-14))
+        lim = accumulator_limbs(toc, 15)
+        got = (lim["ao_acc_lo_bits"], lim["ao_acc_hi_bits"], lim["ao_acc_mag"],
+               lim["ao_acc_prod"], lim["no_wrap_margin"])
+        if got != (16, 6, True, True, 5):
+            bad.append(f"the 8B table of contents reads as (lo, hi, mag, prod, margin) "
+                       f"{got}, and its 22 bits split 16 + 6 in the product form, "
+                       f"margin 5")
+        prod = dict(row, ao_jv_max=-5, ao_jo_min=-14,
+                    **{k: lim[k] for k in ("ao_acc_lo_bits", "ao_acc_hi_bits",
+                                           "ao_acc_mag", "ao_acc_prod")})
+        cfg = (2, 5120, 40, 8, 128, 13824, 152064)
+        hg = [16, 16, 8]
+
+        def counted(r1):
+            doc_ = dict(schema=SCHEMA, layers={"0": row, "1": r1})
+            return pr_.exact_segments(cfg, 4096, doc_, head_groups=hg)[1]
+
+        a_, b_ = counted(dict(prod, ao_acc_prod=False)), counted(prod)
+        ao_pr, _, ao_lr = ec.ao_layout(40, pr_.S, 128, ec.statement_knobs()["ao_target"])
+        if not b_["fields"].get("ao_acc_prod"):
+            bad.append("the predictor's fields for a product-form row do not say so")
+        if (b_["components"]["attnout"] - a_["components"]["attnout"] != ao_pr << ao_lr
+                or b_["table_rows"] - a_["table_rows"] != 1 << 14):
+            bad.append("the predictor does not count the product form's column and "
+                       "its 14-bit table on a product-form row")
+        old = {k: v for k, v in row.items() if k != "ao_acc_prod"}
+        with open(f, "w") as fh:
+            json.dump(dict(build(None, 0, dump=d), layers={"0": old}), fh)
+        back = load(f)["layers"]["0"]
+        if back.get("ao_acc_prod") is not False:
+            bad.append("a row written before the product form does not read as false")
+        if counted(back)["fresh"] != counted(dict(row, ao_acc_prod=False))["fresh"]:
+            bad.append("a row written before the product form counts something else")
     for b in bad:
         print("FAIL:", b)
     print(f"witness_fields selftest: {'FAILED' if bad else 'ok'} -- the key max against a "
           f"brute force over every visible entry, the three ways the table size is "
-          f"decided, the per-field rules, the file's refusals, and the stated block a "
-          f"synthetic segment is counted at")
+          f"decided, the per-field rules, the file's refusals, the stated block a "
+          f"synthetic segment is counted at, and the product form, counted where it "
+          f"is taken and read as false where a file predates it")
     return 1 if bad else 0
 
 

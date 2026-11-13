@@ -102,6 +102,8 @@ def load_run(path):
                     ao_acc_lo_bits=pa.get("ao_acc_lo_bits"),
                     ao_acc_hi_bits=pa.get("ao_acc_hi_bits"),
                     ao_acc_mag=bool(pa.get("ao_acc_mag", False)),
+                    # skipped in the statement unless it is set, as `ao_acc_mag` is
+                    ao_acc_prod=bool(pa.get("ao_acc_prod", False)),
                     ao_jo_min=pa.get("ao_jo_min"), ao_jo_max=pa.get("ao_jo_max"),
                     ao_jv_min=pa.get("ao_jv_min"), ao_jv_max=pa.get("ao_jv_max"),
                     fold_rem_bits=pa.get("fold_rem_bits", 0),
