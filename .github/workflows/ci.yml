@@ -15,7 +15,10 @@ jobs:
     # the runner image already carries cmake, gcc and rustup, so the step below adds
     # only nvcc and the CUDA libraries the vendored fork links.  No GPU is needed to
     # build either backend or to run the SIMD tests.
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: the toolkit below is the ubuntu2404 repository's,
+    # and nvcc 12.9 refuses a gcc newer than 14, which ubuntu-latest moved past
+    # when it became 26.04 (gcc 15).  24.04 ships gcc 13, as the Dockerfile says.
+    runs-on: ubuntu-24.04
     env:
       CUDAARCHS: "90"
       CARGO_TERM_COLOR: always
