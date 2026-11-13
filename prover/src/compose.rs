@@ -4279,6 +4279,12 @@ pub struct ProverTamper {
     /// the high accumulator limb's range check.  The magnitude form only; the
     /// index is a flat `(h, t, ch)` site, as `ao_num`'s is.
     pub ao_mag: Option<usize>,
+    /// The product form's own (`Params::ao_acc_prod`): one slot's committed
+    /// `ahn` one off `ahi num`, and its range table bumped at the value
+    /// committed, so the lookup still lands on a real row and only the
+    /// degree-2 pin `ahn = ahi num` can reject it.  The product form only; the
+    /// index is a flat `(h, t, ch)` site, as `ao_mag`'s is.
+    pub ao_ahn: Option<usize>,
 }
 
 pub fn prove_layer(layer: &Layer, params: &Params, tamper: &ProverTamper) -> Composed {
@@ -4488,7 +4494,7 @@ pub fn generate(layer: &Layer, params: &Params, tamper: &ProverTamper, pre_key: 
             || tamper.ao_clamp.is_some() || tamper.ao_den.is_some()
             || tamper.ao_jo.is_some() || tamper.ao_num.is_some()
             || tamper.ao_acc.is_some() || tamper.ao_jo_tok.is_some()
-            || tamper.ao_mag.is_some()
+            || tamper.ao_mag.is_some() || tamper.ao_ahn.is_some()
             // stream TT (E11), log row 73: and the magnitude form, whose tenth
             // column the fork's `zk_witness_gen_attnout` does not write -- `ao_component`
             // sets its own mode to 0 for it on both backends
@@ -4564,7 +4570,8 @@ pub fn generate(layer: &Layer, params: &Params, tamper: &ProverTamper, pre_key: 
                         p.ao_acc_prod.then(|| ao_prod_bits(p)), p.ao_denp2,
                         p.ao_jv_min, p.ao_jo_max,
                         &mut tables, None, tamper.ao_clamp, tamper.ao_den, tamper.ao_jo,
-                        tamper.ao_num, tamper.ao_acc, tamper.ao_jo_tok, tamper.ao_mag);
+                        tamper.ao_num, tamper.ao_acc, tamper.ao_jo_tok, tamper.ao_mag,
+                        tamper.ao_ahn);
 
     crate::util::add_phase("gen/attnout", phase_t.elapsed().as_secs_f64());
 

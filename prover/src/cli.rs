@@ -2254,6 +2254,8 @@ fn compose_cmd(args: &[String]) {
                         ("--corrupt-ao-jo-tok", &mut tamper.ao_jo_tok),
                         // stream TT (log row 73): the magnitude window's own
                         ("--corrupt-ao-mag", &mut tamper.ao_mag),
+                        // and the product form's (`--ao-acc-prod`)
+                        ("--corrupt-ao-ahn", &mut tamper.ao_ahn),
                         ("--corrupt-freivalds-act", &mut tamper.freivalds_over)] {
         if let Some(i) = arg_str(args, key) {
             *slot = Some(i.parse().unwrap_or_else(|_| panic!("{key} wants an index")));
@@ -3355,6 +3357,19 @@ synthetic generator (Layer::synth_residual_stream_prefix_q_bent); on a dump the 
                                                     ..Default::default() },
                            "the magnitude window's limbs"),
                     "a magnitude past the no-wrap window accepted");
+            // The product form's own (`Params::ao_acc_prod`).  `ahn` is
+            // committed one off `ahi num` in one slot, a step inside its own
+            // table, and the table is bumped at the value committed, so the
+            // lookup lands and every other constraint holds: only the pin
+            // `ahn = ahi num` can see it.  Present only in the product form,
+            // so no other statement's probe list moves.
+            if params.ao_acc_prod {
+                assert!(!probe("attnout: one slot's ahn committed one off ahi num", &l,
+                               &compose::ProverTamper { ao_ahn: Some(params.hd + 4),
+                                                        ..Default::default() },
+                               "the product form's `ahn = ahi num` pin"),
+                        "a product off its own high limb accepted");
+            }
         } else {
             eprintln!("compose probe SKIP attnout magnitude root: this statement is in \
                        the offset form (--ao-acc-mag forces the other)");

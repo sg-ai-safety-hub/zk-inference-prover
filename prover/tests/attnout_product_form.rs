@@ -6,11 +6,13 @@
 //! `params_of` takes it only when the magnitude form's window refuses, which no
 //! synthetic shape does, so `--ao-acc-prod` forces it here.
 //!
-//! This pins three things on the two sound shapes `prover/README.md` records
+//! This pins four things on the two sound shapes `prover/README.md` records
 //! digests for (with and without the five GKR reductions): the honest chunk
 //! proves and verifies in the product form, the suite reaches its last control
-//! with no forgery accepted, and the magnitude form's own control (the
-//! magnitude committed as the negative root, about `2^31`) is still rejected.
+//! with no forgery accepted, the magnitude form's own control (the magnitude
+//! committed as the negative root, about `2^31`) is still rejected, and so is
+//! the product form's own: one slot's `ahn` one off `ahi num`, inside its table,
+//! which only the pin `ahn = ahi num` can see.
 //!
 //! SIMD build only, for the reason `attnout_jo_control.rs` gives: a CUDA
 //! build has no generation kernel for the shapes the suite restates.
@@ -27,6 +29,7 @@ const GKR5: &[&str] =
     &["--gkr-key-tiles", "--gkr-dequant", "--gkr-residual-stream", "--gkr-freivalds", "--gkr-attnout"];
 const MAG_ROOT: &str = "attnout: the magnitude committed as the negative root";
 const LIMB: &str = "attnout: one accumulator limb off its own decomposition";
+const AHN: &str = "attnout: one slot's ahn committed one off ahi num";
 const NO_CONSUMER: &str = "nothing -- this chunk has no consumer for it";
 
 fn suite(name: &str, extra: &[&str]) -> Vec<serde_json::Value> {
@@ -59,12 +62,18 @@ fn check(name: &str, ps: &[serde_json::Value]) {
                        "{name}: {} was accepted", p["probe"]);
         }
     }
-    for control in [MAG_ROOT, LIMB] {
+    for control in [MAG_ROOT, LIMB, AHN] {
         let p = ps.iter().find(|p| p["probe"].as_str() == Some(control))
             .unwrap_or_else(|| panic!("{name}: no record for {control:?}"));
         assert_eq!(p["accepted"], serde_json::Value::Bool(false),
                    "{name}: {control} was not rejected");
     }
+    // and the product form's own is the pin's alone: its lookup landed on a real
+    // row, so what refused it is a constraint the prover could not satisfy
+    let p = ps.iter().find(|p| p["probe"].as_str() == Some(AHN)).expect("found above");
+    assert_eq!(p["off_table"], serde_json::json!(0), "{name}: {AHN} left its table");
+    assert_eq!(p["prove_error"], serde_json::json!("ConstraintsNotSatisfied"),
+               "{name}: {AHN} was not refused by a constraint");
 }
 
 #[test]

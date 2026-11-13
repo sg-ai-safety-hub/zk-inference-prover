@@ -102,7 +102,7 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
                  corrupt_q: Option<usize>, corrupt_den: Option<usize>,
                  corrupt_jo: Option<usize>, corrupt_num: Option<usize>,
                  corrupt_acc: Option<usize>, corrupt_jo_tok: Option<usize>,
-                 corrupt_mag: Option<usize>) -> AoComponent {
+                 corrupt_mag: Option<usize>, corrupt_ahn: Option<usize>) -> AoComponent {
     let lay = AoLayout::choose(ao.nh, ao.s, ao.hd, per_row_target);
     let rows = 1usize << lay.log_rows;
     let pr = lay.per_row;
@@ -117,7 +117,7 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
     let witness_gen_mode = if corrupt_q.is_some() || corrupt_den.is_some() || corrupt_jo.is_some()
                              || corrupt_num.is_some() || corrupt_acc.is_some()
                              || corrupt_jo_tok.is_some() || corrupt_mag.is_some()
-                             || acc_mag || denp2 {
+                             || corrupt_ahn.is_some() || acc_mag || denp2 {
         0
     } else {
         crate::util::path_mode("ZK_DEVICE_WITNESS_GEN_ATTENTION_FREIVALDS")
@@ -188,6 +188,8 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
     // stream TT: zero in the magnitude form -- the limbs read `mag` itself
     let acc_off = if acc_mag { 0 } else { 1i64 << (acc_lo_bits + acc_hi_bits - 1) };
     assert!(acc_prod.is_none() || acc_mag, "the product form needs the magnitude form");
+    assert!(corrupt_ahn.is_none() || acc_prod.is_some(),
+            "--corrupt-ao-ahn is the product form's control; this statement is not in it");
     let ncs = slot_cols(acc_mag, acc_prod.is_some());
     let bend_den: Option<usize> = corrupt_den.map(|idx| {
         let (ht, ch) = (idx / ao.hd, idx % ao.hd);
@@ -382,6 +384,15 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
                                     || corrupt_num == Some(idx) || ahn < 1i64 << pb,
                                 "attnout: ahi num = {ahn} outside the product form's \
                                  {pb}-bit table (|acc| = {mag}, num = {num})");
+                        // the product form's control: `ahn` one off `ahi num`,
+                        // a step that stays inside its own table, and the
+                        // table bumped at what is committed -- so the lookup
+                        // lands and only the pin `ahn = ahi num` can see it
+                        let ahn = match corrupt_ahn == Some(idx) {
+                            true if ahn + 1 < 1i64 << pb => ahn + 1,
+                            true => ahn - 1,
+                            false => ahn,
+                        };
                         cols[c0 + 10][j] = m31_of(ahn);
                         tables.bump_rk(pb, ahn, "ao_acc_prod");
                     }
