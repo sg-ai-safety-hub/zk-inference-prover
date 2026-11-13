@@ -31,6 +31,9 @@ pub struct AoComponent {
     /// `mag = |acc|` as a tenth column and the two limbs range-check *it*, so
     /// `acc_off` is not used and the widths cover one bit less
     pub acc_mag: bool,
+    /// the product form: the width of the `ahn = ahi num` range table, and
+    /// with it an eleventh column per slot; `None` in the other two forms
+    pub acc_prod: Option<u32>,
     /// stream TT (log row 73): the sibling bound's half -- `2 denp` is looked
     /// up in the `rem_bits` table instead of `denp`, which is the width an
     /// honest `denp` has and one bit better than the plain form states
@@ -44,11 +47,27 @@ impl AoComponent {
     pub fn acc_off(&self) -> i64 {
         if self.acc_mag { 0 } else { 1i64 << (self.acc_lo_bits + self.acc_hi_bits - 1) }
     }
-    /// Columns per channel slot: `acc, sg, qm, nz2, denp, d, num, pj, alo`, and
-    /// in the magnitude form `mag` after them.
+    /// Columns per channel slot: `acc, sg, qm, nz2, denp, d, num, pj, alo`, in
+    /// the magnitude form `mag` after them, and in the product form `ahn` last.
     pub fn per_slot(&self) -> usize {
-        if self.acc_mag { 10 } else { 9 }
+        slot_cols(self.acc_mag, self.acc_prod.is_some())
     }
+    /// Lookups per channel slot, in AIR order: the `EPOW` window, `(qm, nz2)`,
+    /// `d`, `dp`, `denp`, the two limbs, and in the product form `ahn`.
+    pub fn looks_per_slot(&self) -> usize {
+        slot_looks(self.acc_prod.is_some())
+    }
+}
+
+/// `AoComponent::per_slot`, from the two form flags alone.
+pub fn slot_cols(acc_mag: bool, acc_prod: bool) -> usize {
+    9 + usize::from(acc_mag) + usize::from(acc_prod)
+}
+
+/// `AoComponent::looks_per_slot`, from the form flag alone, for the
+/// verifier's site list, which has no component.
+pub fn slot_looks(acc_prod: bool) -> usize {
+    7 + usize::from(acc_prod)
 }
 
 impl AoComponent {
@@ -77,13 +96,13 @@ impl AoComponent {
 /// accumulator and `gkrlink`'s binding read the same column they always did.
 #[allow(clippy::too_many_arguments)]
 pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: u32,
-                 acc_bits: (u32, u32), acc_mag: bool, denp2: bool,
+                 acc_bits: (u32, u32), acc_mag: bool, acc_prod: Option<u32>, denp2: bool,
                  jv_min: i32, jo_max: i32,
                  tables: &mut Tables, corrupt: Option<usize>,
                  corrupt_q: Option<usize>, corrupt_den: Option<usize>,
                  corrupt_jo: Option<usize>, corrupt_num: Option<usize>,
                  corrupt_acc: Option<usize>, corrupt_jo_tok: Option<usize>,
-                 corrupt_mag: Option<usize>) -> AoComponent {
+                 corrupt_mag: Option<usize>, corrupt_ahn: Option<usize>) -> AoComponent {
     let lay = AoLayout::choose(ao.nh, ao.s, ao.hd, per_row_target);
     let rows = 1usize << lay.log_rows;
     let pr = lay.per_row;
@@ -98,7 +117,7 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
     let witness_gen_mode = if corrupt_q.is_some() || corrupt_den.is_some() || corrupt_jo.is_some()
                              || corrupt_num.is_some() || corrupt_acc.is_some()
                              || corrupt_jo_tok.is_some() || corrupt_mag.is_some()
-                             || acc_mag || denp2 {
+                             || corrupt_ahn.is_some() || acc_mag || denp2 {
         0
     } else {
         crate::util::path_mode("ZK_DEVICE_WITNESS_GEN_ATTENTION_FREIVALDS")
@@ -168,7 +187,10 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
     let (acc_lo_bits, acc_hi_bits) = acc_bits;
     // stream TT: zero in the magnitude form -- the limbs read `mag` itself
     let acc_off = if acc_mag { 0 } else { 1i64 << (acc_lo_bits + acc_hi_bits - 1) };
-    let ncs = if acc_mag { 10 } else { 9 };
+    assert!(acc_prod.is_none() || acc_mag, "the product form needs the magnitude form");
+    assert!(corrupt_ahn.is_none() || acc_prod.is_some(),
+            "--corrupt-ao-ahn is the product form's control; this statement is not in it");
+    let ncs = slot_cols(acc_mag, acc_prod.is_some());
     let bend_den: Option<usize> = corrupt_den.map(|idx| {
         let (ht, ch) = (idx / ao.hd, idx % ao.hd);
         let (h, t) = (ht / ao.s, ht % ao.s);
@@ -189,7 +211,7 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
         let (ref_bad, q_out) = (dev.ref_bad, dev.q_out.clone());
         return AoComponent { lay, pre: vec![], base: vec![], dev: Some(dev), ref_bad, q_out,
                           n: ao.nh * ao.s * ao.hd, rem_bits, q_bits,
-                          acc_lo_bits, acc_hi_bits, acc_mag, denp2 };
+                          acc_lo_bits, acc_hi_bits, acc_mag, acc_prod, denp2 };
     }
     // `ZK_DEVICE_WITNESS_GEN_ATTENTION_FREIVALDS=2` builds this component twice -- host here, device below --
     // and the device call bumps the same counters a second time, so every
@@ -242,6 +264,10 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
                     tables.bump_rk(acc_lo_bits, acc_off & ((1i64 << acc_lo_bits) - 1),
                                    "ao_acc_lead");
                     tables.bump_rk(acc_hi_bits, acc_off >> acc_lo_bits, "ao_acc_lead");
+                    // the product form: `mag = 0` on an inert row, so `ahn = 0`
+                    if let Some(pb) = acc_prod {
+                        tables.bump_rk(pb, 0, "ao_acc_prod_lead");
+                    }
                 }
             }
             Some((h, t, b)) => {
@@ -346,6 +372,30 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
                     if acc_mag {
                         cols[c0 + 9][j] = m31_of(magv);
                     }
+                    // the product form's eleventh column, `ahn = ahi num`, of
+                    // the same field representative the limbs decompose.  An
+                    // honest slot has `2 mag num < 2^31 - 1` (asserted above),
+                    // so `ahn <= mag num / 2^lo < 2^(30 - lo)` lands in its
+                    // table; a bent magnitude does not, which is the point.
+                    let ahi = (fv - alo) >> acc_lo_bits;
+                    if let Some(pb) = acc_prod {
+                        let ahn = ahi * num;
+                        assert!(corrupt_mag == Some(idx) || corrupt_acc == Some(idx)
+                                    || corrupt_num == Some(idx) || ahn < 1i64 << pb,
+                                "attnout: ahi num = {ahn} outside the product form's \
+                                 {pb}-bit table (|acc| = {mag}, num = {num})");
+                        // the product form's control: `ahn` one off `ahi num`,
+                        // a step that stays inside its own table, and the
+                        // table bumped at what is committed -- so the lookup
+                        // lands and only the pin `ahn = ahi num` can see it
+                        let ahn = match corrupt_ahn == Some(idx) {
+                            true if ahn + 1 < 1i64 << pb => ahn + 1,
+                            true => ahn - 1,
+                            false => ahn,
+                        };
+                        cols[c0 + 10][j] = m31_of(ahn);
+                        tables.bump_rk(pb, ahn, "ao_acc_prod");
+                    }
                     tables.bump_ek(e, "ao_epow");
                     tables.bump_qnzk(qm, "ao_qnz");
                     tables.bump_rk(rem_bits, d, "ao_rem_d");
@@ -358,7 +408,7 @@ pub fn ao_component(ao: &AttnOut, per_row_target: usize, q_bits: u32, rem_bits: 
                     // is `2 mag num` with `num <= 2^e_hi` from the `EPOW` table
                     // and `mag` bounded here, in two limbs
                     tables.bump_rk(acc_lo_bits, alo, "ao_acc_lo");
-                    tables.bump_rk(acc_hi_bits, (fv - alo) >> acc_lo_bits, "ao_acc_hi");
+                    tables.bump_rk(acc_hi_bits, ahi, "ao_acc_hi");
                     q_out[idx] = if a < 0 { -qm } else { qm };
                     // the reference: one f64 rounding, half away from zero.  It
                     // reads `num / pj` rather than `2^(jv - jo)` -- the same
@@ -462,7 +512,7 @@ all five multiplicity tables and the f64 reference all match",
         debug_assert_eq!(q_out, ao.q_ref(), "attnout: q_out and AttnOut::q_ref disagree");
     }
     AoComponent { lay, pre, base, dev: None, ref_bad, q_out, n: ao.nh * ao.s * ao.hd,
-               rem_bits, q_bits, acc_lo_bits, acc_hi_bits, acc_mag, denp2 }
+               rem_bits, q_bits, acc_lo_bits, acc_hi_bits, acc_mag, acc_prod, denp2 }
 }
 
 impl Layer {

@@ -1282,8 +1282,14 @@ pub fn params_of(l: &layer::Layer, args: &[String], vname: &str) -> compose::Par
     let need_off = l.ao.acc_bits() + 1;
     let (lo_off, hi_off) = split(need_off);
     let (lo_mag, hi_mag) = split(l.ao.acc_bits());
+    // The product form (`Params::ao_acc_prod`) keeps the magnitude form's
+    // limbs and bounds `mag num` slot by slot, so the limbs stop adding.  It is
+    // taken only when the magnitude form's window would refuse, so every chunk
+    // that composed before it keeps its form, columns and digest.
+    // `--ao-acc-prod` forces it, which is what its controls use.
+    let ao_acc_prod = flag(args, "--ao-acc-prod") || 1 + lo_mag + hi_mag + e_hi > 31;
     let ao_acc_mag =
-        flag(args, "--ao-acc-mag") || 1 + lo_off + hi_off + e_hi > 31;
+        ao_acc_prod || flag(args, "--ao-acc-mag") || 1 + lo_off + hi_off + e_hi > 31;
     let (ao_acc_lo_bits, ao_acc_hi_bits, need) = if ao_acc_mag {
         (lo_mag, hi_mag, l.ao.acc_bits())
     } else {
@@ -1295,7 +1301,10 @@ pub fn params_of(l: &layer::Layer, args: &[String], vname: &str) -> compose::Par
                 && ao_acc_hi_bits >= crate::common::MIN_LOG_ROWS,
             "--ao-acc-*-bits {ao_acc_lo_bits}+{ao_acc_hi_bits}: a limb is below \
              MIN_LOG_ROWS");
-    if ao_acc_mag && !flag(args, "--ao-acc-mag") {
+    if ao_acc_prod && !flag(args, "--ao-acc-prod") {
+        eprintln!("compose: the attention output takes the product form -- the \
+                   magnitude window is 1 + {lo_mag} + {hi_mag} + {e_hi} > 31");
+    } else if ao_acc_mag && !ao_acc_prod && !flag(args, "--ao-acc-mag") {
         eprintln!("compose: the attention output takes the magnitude form -- the \
                    offset window is 1 + {lo_off} + {hi_off} + {e_hi} > 31 (log row 73)");
     }
@@ -1357,7 +1366,7 @@ pub fn params_of(l: &layer::Layer, args: &[String], vname: &str) -> compose::Par
         // (Both are derived above, with the `denp2` decision that reads them.)
         ao_rem_bits,
         ao_jv_min, ao_jv_max, ao_jo_min, ao_jo_max,
-        ao_acc_lo_bits, ao_acc_hi_bits, ao_acc_mag, ao_denp2,
+        ao_acc_lo_bits, ao_acc_hi_bits, ao_acc_mag, ao_acc_prod, ao_denp2,
         // Stream Z: the fold's two pins, data-derived exactly as `ao_rem_bits`
         // and overridable the same way so a driver can pin the model-wide worst
         // case.  Zero -- absent from the serialized statement -- on a witness
@@ -2245,6 +2254,8 @@ fn compose_cmd(args: &[String]) {
                         ("--corrupt-ao-jo-tok", &mut tamper.ao_jo_tok),
                         // stream TT (log row 73): the magnitude window's own
                         ("--corrupt-ao-mag", &mut tamper.ao_mag),
+                        // and the product form's (`--ao-acc-prod`)
+                        ("--corrupt-ao-ahn", &mut tamper.ao_ahn),
                         ("--corrupt-freivalds-act", &mut tamper.freivalds_over)] {
         if let Some(i) = arg_str(args, key) {
             *slot = Some(i.parse().unwrap_or_else(|_| panic!("{key} wants an index")));
@@ -2258,7 +2269,7 @@ acc={}+{}",
               params.ao_jv_min, params.ao_jv_max, params.ao_jo_min, params.ao_jo_max,
               params.ao_acc_lo_bits, params.ao_acc_hi_bits);
     if params.ao_acc_mag {
-        eprintln!("compose: attnout accumulator in the magnitude form (log row 73)");
+        eprintln!("compose: attnout accumulator in the {} form", compose::ao_form(&params));
     }
     // Stream I: `--ser-dir DIR [--ser-tag TAG]` leaves this chunk's statement and
     // proof on disk under that tag, which is what `boundary-chain` reads back.
@@ -3346,6 +3357,19 @@ synthetic generator (Layer::synth_residual_stream_prefix_q_bent); on a dump the 
                                                     ..Default::default() },
                            "the magnitude window's limbs"),
                     "a magnitude past the no-wrap window accepted");
+            // The product form's own (`Params::ao_acc_prod`).  `ahn` is
+            // committed one off `ahi num` in one slot, a step inside its own
+            // table, and the table is bumped at the value committed, so the
+            // lookup lands and every other constraint holds: only the pin
+            // `ahn = ahi num` can see it.  Present only in the product form,
+            // so no other statement's probe list moves.
+            if params.ao_acc_prod {
+                assert!(!probe("attnout: one slot's ahn committed one off ahi num", &l,
+                               &compose::ProverTamper { ao_ahn: Some(params.hd + 4),
+                                                        ..Default::default() },
+                               "the product form's `ahn = ahi num` pin"),
+                        "a product off its own high limb accepted");
+            }
         } else {
             eprintln!("compose probe SKIP attnout magnitude root: this statement is in \
                        the offset form (--ao-acc-mag forces the other)");

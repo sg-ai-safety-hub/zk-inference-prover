@@ -1149,7 +1149,7 @@ mod tests {
             // stream TT (E11), log row 73: the offset form and the plain
             // quotient bound, which is what every statement that composed
             // before these two fields existed carries.
-            ao_acc_mag: false, ao_denp2: false,
+            ao_acc_mag: false, ao_acc_prod: false, ao_denp2: false,
             fold_rem_bits: 0, fold_alpha: 0, freivalds_p: 136,
             residual_stream: Some(crate::compose::ResidualStreamParams {
                 // stream II: the two additive components are unconditional, so this

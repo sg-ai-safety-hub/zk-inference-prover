@@ -250,6 +250,31 @@ pub struct Params {
     /// either.  `y-delay-vw12`'s layer-0 chunks are what need it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ao_acc_mag: bool,
+    /// The **product form** of the same window, on top of the magnitude form.
+    /// The two forms above bound `mag` and `num` each by its own maximum over
+    /// the whole chunk, so the window is `1 + lo + hi + e_hi` even though the
+    /// largest `|acc|` and the largest exponent never sit in the same slot: on
+    /// a 512-token table of contents at Llama 3.1 8B layer 1 the window comes
+    /// to 32 while the largest `mag num` any slot holds is 27 bits.
+    ///
+    /// With it on, the slot commits an eleventh column `ahn = ahi num`, the
+    /// high limb times the slot's own `num`, and range-checks it in a table of
+    /// `ao_prod_bits() = 30 - lo` bits.  Because `num = 2^j` is pinned by the
+    /// `EPOW` lookup and `ahn` is a multiple of it below `2^(30 - lo)`,
+    ///     mag num = alo num + 2^lo ahn
+    ///             <= (2^lo - 1) 2^j + 2^lo (2^(30-lo) - 2^j) = 2^30 - 2^j,
+    /// so `2 mag num <= 2^31 - 2^(j+1) < p` in every slot: the bound the window
+    /// states, slot by slot instead of across the chunk.  `Plan::new` asks only
+    /// that `ahn = ahi num` cannot wrap and that every `j` leaves the limb room
+    /// (`hi + e_hi <= 30` and `lo + e_hi <= 30`).  An honest slot always fits,
+    /// because `2 mag num < 2^31 - 1` is what the trace builder asserts.  It
+    /// costs one committed column and one lookup per slot.
+    ///
+    /// Off unless the magnitude form does not fit either (`cli.rs`'s
+    /// `params_of`), and skipped in the serialization then, so no statement
+    /// that composed before it moves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ao_acc_prod: bool,
     /// Stream TT (E11), log row 73, the sibling bound's half.  With it on the
     /// component looks up `2 denp` in the `ao_rem_bits` table rather than `denp`,
     /// which states `denp <= 2^(rem-1) - 1` -- the width an honest `denp`
@@ -1711,10 +1736,28 @@ pub struct Plan {
 /// small number and the window accepted it. `Fixed.params` is deserialized
 /// before `verify_composed` builds its plan, so that reading was the verifier's
 /// as well as the prover's.
+///
+/// The product form bounds `mag num` slot by slot (`Params::ao_acc_prod`), so
+/// the limbs no longer add: what has to fit is each limb times `2^e_hi` on its
+/// own, `lo + e_hi <= 30` so every `num` leaves the high limb's product room,
+/// and `hi + e_hi <= 30` so `ahn = ahi num` cannot wrap.  Both are
+/// `1 + max(lo, hi) + e_hi <= 31`, which is what it reports.
 pub fn ao_wrap_window(p: &Params) -> (i64, i64) {
-    let used = 1 + i64::from(p.ao_acc_lo_bits) + i64::from(p.ao_acc_hi_bits)
-        + ao_e_hi(p).max(0);
+    let (lo, hi) = (i64::from(p.ao_acc_lo_bits), i64::from(p.ao_acc_hi_bits));
+    let limbs = if p.ao_acc_prod { lo.max(hi) } else { lo + hi };
+    let used = 1 + limbs + ao_e_hi(p).max(0);
     (used, 31 - used)
+}
+
+/// The product form's range table: `ahn = ahi num` is checked below
+/// `2^(30 - lo)`, which is what puts `mag num` below `2^30`.
+pub fn ao_prod_bits(p: &Params) -> u32 {
+    30u32.saturating_sub(p.ao_acc_lo_bits)
+}
+
+/// The three names a statement's window form goes by in a run's JSON.
+pub fn ao_form(p: &Params) -> &'static str {
+    if p.ao_acc_prod { "product" } else if p.ao_acc_mag { "magnitude" } else { "offset" }
 }
 
 /// The top of the exponent window, `e_hi = jv_max - jo_min`, in `i64` for the
@@ -1744,7 +1787,7 @@ pub fn ao_wrap_json(p: &Params) -> Value {
         "acc_lo_bits": p.ao_acc_lo_bits,
         "acc_hi_bits": p.ao_acc_hi_bits,
         "e_hi": ao_e_hi(p).max(0),
-        "form": if p.ao_acc_mag { "magnitude" } else { "offset" },
+        "form": ao_form(p),
         "quotient": {
             "bits": q_used,
             "limit": if p.ao_denp2 { 31 } else { 30 },
@@ -1893,14 +1936,34 @@ impl Plan {
         // and `e_hi` is the `EPOW` table's own domain, so what the refusal
         // offers is the one bit the magnitude form is worth and after that a
         // narrower shape.
+        //
+        // The third form is the product form (`Params::ao_acc_prod`): no
+        // decomposition of `|acc|` recovers a bit, but the window was never
+        // about `|acc|` alone.  It bounds the product `mag num`, and the
+        // largest `|acc|` and the largest exponent are a chunk-wide pair that
+        // no slot holds.  The product form range-checks `ahn = ahi num` per
+        // slot, so the limbs stop adding and what is left of the window is
+        // `1 + max(lo, hi) + e_hi <= 31` (`ao_wrap_window`).
+        assert!(!p.ao_acc_prod || p.ao_acc_mag,
+                "the product form is built on the magnitude form's committed |acc|");
+        assert!(!p.ao_acc_prod || ao_prod_bits(p) >= crate::common::MIN_LOG_ROWS,
+                "the product form's {}-bit table is narrower than a range table's \
+                 shortest column", ao_prod_bits(p));
         let (used, margin) = ao_wrap_window(p);
         assert!(margin >= 0,
-                "the attention output's no-wrap window does not fit:                  1 + {} + {} + {} = {used} > 31 (over by {}){}.                  The two limbs must together cover |acc| and the exponent window must                  cover e = jv - jo, so no wider decomposition of either recovers a bit;                  what is left is {}",
-                p.ao_acc_lo_bits, p.ao_acc_hi_bits, e_hi.max(0), -margin,
-                if p.ao_acc_mag { " (magnitude form)" } else { "" },
-                if p.ao_acc_mag {
-                    "a narrower context, a quantization whose accumulator is narrower, \
-                     or a third form of this bound (issue #19)"
+                "the attention output's no-wrap window does not fit:                  1 + {} = {used} > 31 (over by {}){}.                  The limbs must cover |acc| and the exponent window must                  cover e = jv - jo; what is left is {}",
+                if p.ao_acc_prod {
+                    format!("max({}, {}) + {}", p.ao_acc_lo_bits, p.ao_acc_hi_bits, e_hi.max(0))
+                } else {
+                    format!("{} + {} + {}", p.ao_acc_lo_bits, p.ao_acc_hi_bits, e_hi.max(0))
+                },
+                -margin,
+                match ao_form(p) { "offset" => String::new(), f => format!(" ({f} form)") },
+                if p.ao_acc_prod {
+                    "a narrower exponent window or a narrower high limb"
+                } else if p.ao_acc_mag {
+                    "the product form, which bounds `mag num` slot by slot and which \
+                     `params_of` takes for a witness the magnitude form does not fit"
                 } else {
                     "the magnitude form, which is worth one bit and which `params_of` \
                      takes for a witness the offset form does not fit"
@@ -1956,6 +2019,11 @@ impl Plan {
                 (-e_lo).max(0), p.ao_rem_bits);
         let mut widths = vec![p.k_bits, p.q_bits, 8, p.z_lo_bits, p.z_hi_bits, p.ao_rem_bits,
                               p.ao_acc_lo_bits, p.ao_acc_hi_bits];
+        // the product form's `ahn = ahi num` table; pushed only in that form,
+        // so no other statement's table list moves
+        if p.ao_acc_prod {
+            widths.push(ao_prod_bits(p));
+        }
         if let AttnVariant::IntSplit(k) = attn_variant {
             widths.push(k);
         }
@@ -3430,6 +3498,7 @@ pub fn build_components_linked(plan: &Plan, rels: &Rels, r: SecureField, s: Secu
             epow: rels.epow.clone(),
             rel_acc_lo: rels.range(p.ao_acc_lo_bits).clone(),
             rel_acc_hi: rels.range(p.ao_acc_hi_bits).clone(),
+            rel_acc_prod: p.ao_acc_prod.then(|| rels.range(ao_prod_bits(p)).clone()),
             acc_lo_bits: p.ao_acc_lo_bits,
             acc_hi_bits: p.ao_acc_hi_bits,
             acc_mag: p.ao_acc_mag,
@@ -4210,6 +4279,12 @@ pub struct ProverTamper {
     /// the high accumulator limb's range check.  The magnitude form only; the
     /// index is a flat `(h, t, ch)` site, as `ao_num`'s is.
     pub ao_mag: Option<usize>,
+    /// The product form's own (`Params::ao_acc_prod`): one slot's committed
+    /// `ahn` one off `ahi num`, and its range table bumped at the value
+    /// committed, so the lookup still lands on a real row and only the
+    /// degree-2 pin `ahn = ahi num` can reject it.  The product form only; the
+    /// index is a flat `(h, t, ch)` site, as `ao_mag`'s is.
+    pub ao_ahn: Option<usize>,
 }
 
 pub fn prove_layer(layer: &Layer, params: &Params, tamper: &ProverTamper) -> Composed {
@@ -4419,7 +4494,7 @@ pub fn generate(layer: &Layer, params: &Params, tamper: &ProverTamper, pre_key: 
             || tamper.ao_clamp.is_some() || tamper.ao_den.is_some()
             || tamper.ao_jo.is_some() || tamper.ao_num.is_some()
             || tamper.ao_acc.is_some() || tamper.ao_jo_tok.is_some()
-            || tamper.ao_mag.is_some()
+            || tamper.ao_mag.is_some() || tamper.ao_ahn.is_some()
             // stream TT (E11), log row 73: and the magnitude form, whose tenth
             // column the fork's `zk_witness_gen_attnout` does not write -- `ao_component`
             // sets its own mode to 0 for it on both backends
@@ -4491,10 +4566,12 @@ pub fn generate(layer: &Layer, params: &Params, tamper: &ProverTamper, pre_key: 
 
     let phase_t = std::time::Instant::now();
     let aor = ao_component(&layer.ao, p.ao_target, p.ao_q_bits, p.ao_rem_bits,
-                        (p.ao_acc_lo_bits, p.ao_acc_hi_bits), p.ao_acc_mag, p.ao_denp2,
+                        (p.ao_acc_lo_bits, p.ao_acc_hi_bits), p.ao_acc_mag,
+                        p.ao_acc_prod.then(|| ao_prod_bits(p)), p.ao_denp2,
                         p.ao_jv_min, p.ao_jo_max,
                         &mut tables, None, tamper.ao_clamp, tamper.ao_den, tamper.ao_jo,
-                        tamper.ao_num, tamper.ao_acc, tamper.ao_jo_tok, tamper.ao_mag);
+                        tamper.ao_num, tamper.ao_acc, tamper.ao_jo_tok, tamper.ao_mag,
+                        tamper.ao_ahn);
 
     crate::util::add_phase("gen/attnout", phase_t.elapsed().as_secs_f64());
 
@@ -8614,6 +8691,61 @@ mod tests {
     fn a_limb_width_that_wraps_a_u32_is_refused() {
         let p = crate::exprprobe::tests::params_no_prefix();
         let _ = Plan::new(&Params { ao_acc_lo_bits: u32::MAX - 20, ..p });
+    }
+
+    /// The product form's window, on the Llama 3.1 8B dump it exists for:
+    /// block 0 layer 1 of a 512-token table of contents, whose 22-bit
+    /// accumulator splits 16 + 6 and whose exponents reach `jv_max = -5`,
+    /// `jo_min = -14`.  The magnitude form adds the limbs, `1 + 16 + 6 + 9 = 32`;
+    /// the product form bounds `mag num` per slot, so it is `1 + max(16, 6) + 9`.
+    fn params_toc() -> Params {
+        Params { ao_acc_lo_bits: 16, ao_acc_hi_bits: 6, ao_jv_max: -5, ao_jo_min: -14,
+                 ao_jo_max: -10, ao_acc_mag: true,
+                 ..crate::exprprobe::tests::params_no_prefix() }
+    }
+
+    #[test]
+    fn the_product_form_admits_the_8b_table_of_contents() {
+        let p = Params { ao_acc_prod: true, ..params_toc() };
+        assert_eq!(ao_wrap_window(&p), (26, 5));
+        assert_eq!(ao_prod_bits(&p), 14);
+        let j = ao_wrap_json(&p);
+        assert_eq!(j["form"], json!("product"));
+        assert_eq!(j["margin"], json!(5));
+        let plan = Plan::new(&p);
+        // the product's own range table is in the plan's list
+        assert!(plan.widths.contains(&14), "no 14-bit table for ahn: {:?}", plan.widths);
+    }
+
+    /// The same dump in the magnitude form is the refusal the extraction hit.
+    #[test]
+    #[should_panic(expected = "1 + 16 + 6 + 9 = 32 > 31 (over by 1) (magnitude form)")]
+    fn the_magnitude_form_refuses_the_8b_table_of_contents() {
+        let _ = Plan::new(&params_toc());
+    }
+
+    /// The product form's own wall: a limb times `2^e_hi` past the field.
+    #[test]
+    #[should_panic(expected = "1 + max(16, 6) + 15 = 32 > 31 (over by 1) (product form)")]
+    fn an_exponent_window_past_the_product_form_is_refused() {
+        let _ = Plan::new(&Params { ao_acc_prod: true, ao_jo_min: -20, ..params_toc() });
+    }
+
+    /// The product form reads the magnitude form's committed `|acc|`.
+    #[test]
+    #[should_panic(expected = "built on the magnitude form")]
+    fn the_product_form_needs_the_magnitude_form() {
+        let _ = Plan::new(&Params { ao_acc_prod: true, ao_acc_mag: false, ..params_toc() });
+    }
+
+    /// And the forms that composed before it keep their tables.
+    #[test]
+    fn the_other_forms_add_no_table() {
+        let off = crate::exprprobe::tests::params_no_prefix();
+        let mag = Params { ao_acc_mag: true, ..off.clone() };
+        assert_eq!(Plan::new(&off).widths, Plan::new(&mag).widths);
+        assert!(!serde_json::to_string(&mag).unwrap().contains("ao_acc_prod"),
+                "a statement not in the product form names it");
     }
 
     /// The same hole in the sibling bound: `q_bits + rem_bits` wrapped too.

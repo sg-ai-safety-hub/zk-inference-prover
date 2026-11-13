@@ -559,6 +559,18 @@ def no_wrap_selftest():
         # magnitude form is taken -- the one bit it is worth, and no more
         ("one bit more, and the magnitude form is what fits",
          (26, -6, -10, 8, 8), 31, 0, "magnitude", 15, 15, "plain"),
+        # and one more past that: the product form bounds `mag num` slot by
+        # slot, so the limbs stop adding and the window is `1 + max(lo, hi) + e_hi`
+        ("one bit past the magnitude form, in the product form",
+         (27, -6, -10, 8, 8), 21, 10, "product", 15, 15, "plain"),
+        # the Llama 3.1 8B dump this form was written for: block 0 layer 1 of a
+        # 512-token table of contents (`table_of_contents` in
+        # `harness/witness/fixtures/no_wrap_prompts.json`), whose
+        # 22-bit accumulator the magnitude form refused at `1 + 16 + 6 + 9 = 32`
+        # (the window's three numbers are that dump's; the quotient's two are the
+        # synthetic shape's, since that half is the pin's and not this form's)
+        ("the 8B table of contents, block 0 layer 1",
+         (22, -5, -14, 8, 8), 26, 5, "product", 15, 15, "plain"),
         # the sibling bound, at the E11 set's fold width: 11 + 20 is past the
         # plain form's 30, so the denp2 form is taken and lands on its own cap
         ("the quotient's margin spent to zero, in the denp2 form",
@@ -579,8 +591,8 @@ def no_wrap_selftest():
     # and one bit past each of the two, which is the refusal this check exists
     # for: an extraction that would not prove, named with its numbers
     for label, args, want in [
-        ("an accumulator one bit past the no-wrap window",
-         (27, -6, -10, 8, 8), "1 + 16 + 11 + 4 = 32 > 31 (over by 1, magnitude form)"),
+        ("an exponent window one bit past the product form",
+         (27, -6, -21, 8, 8), "1 + max(16, 11) + 15 = 32 > 31 (over by 1, product form)"),
         ("a divisor range one bit past the quotient term",
          (19, -6, -10, 12, 21), "11 + 21 = 32 > 31 (over by 1, denp2 form)"),
     ]:

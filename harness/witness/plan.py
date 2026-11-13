@@ -134,7 +134,15 @@ import sys
 import tempfile
 
 from .shapes import (ao_head_refusal, ao_head_report, ao_head_row, ao_pin, ao_pin_refusals,
-                     ao_pin_row, ao_where, ao_window_report)
+                     ao_pin_row, ao_row_of, ao_row_window, ao_where, ao_window_report)
+
+
+def ao_form(row):
+    """The attention output's form a row composes in (`params_of`), or `None` if the row
+    states no window.  The form is shape-bearing: the product form commits a column and a
+    lookup the other two do not, so a line in it is its own constraint kernel."""
+    w = ao_row_window(row, 0)
+    return w["form"] if w else None
 
 
 def read_rows(path):
@@ -404,7 +412,10 @@ def main():
             lines.append(line)
             n_rows += 1
             n_layer_rows += 1
-            emit.setdefault((rows[k]["c"], tb, False, extra), line)
+            # the form is part of the key: one product-form layer among offset-form
+            # ones at the same (c, table bits) is a kernel shape of its own, and keyed
+            # without it the layer proved against kernels generated for the others
+            emit.setdefault((rows[k]["c"], tb, False, extra, ao_form(rows[k])), line)
         if a.head and (b in head_blocks if head_blocks is not None else b == blocks[-1]):
             hdir = f"{a.head}_B{b}" if a.head_per_block else a.head
             hman = json.load(open(f"{hdir}/manifest.json"))
@@ -432,7 +443,7 @@ def main():
             # prefix at all they were one entry, only the first block's line
             # reached the emit list, and the second head chunk proved against a
             # feed kernel that was never generated.
-            emit.setdefault((hman["c"], htb, True, hf), hl)
+            emit.setdefault((hman["c"], htb, True, hf, ao_form(ao_row_of(hman))), hl)
             # issue #125: the head line's own bound, both halves, at the pin
             # this line resolves.  The head chunk proves the attention output's
             # rounding like any layer chunk -- its dump is that layer's dump
@@ -494,8 +505,9 @@ def main():
 
     if a.emit_out:
         el = [f"# stream DD: {len(emit)} distinct emit shapes for the {n_rows} chunks of "
-              f"{a.out}; the key is (prefix c, master table bits, head, the line's flags)"]
-        for key in sorted(emit, key=lambda k: (k[2], k[0], k[1], k[3])):
+              f"{a.out}; the key is (prefix c, master table bits, head, the line's flags, "
+              f"the attention output's form)"]
+        for key in sorted(emit, key=lambda k: (k[2], k[0], k[1], k[3], k[4] or "")):
             el.append(emit[key])
         os.makedirs(os.path.dirname(a.emit_out) or ".", exist_ok=True)
         with open(a.emit_out, "w") as f:
@@ -504,7 +516,7 @@ def main():
               f"x{n_rows / max(len(emit), 1):.1f} fewer cudaemit launches)")
 
 
-def _shape_table(d, b, rems, bits=12, acc=None):
+def _shape_table(d, b, rems, bits=12, acc=None, jv=-6, jo=-10):
     """One block's shape table, with only the fields a plan reads.
 
     `bits` is the fold's target width, one value or one per row: a set whose
@@ -518,10 +530,13 @@ def _shape_table(d, b, rems, bits=12, acc=None):
         bits = [bits] * len(rems)
     if not isinstance(acc, list):
         acc = [acc] * len(rems)
+    # the two exponent extremes, one value or one per row, as `acc` is
+    jv = jv if isinstance(jv, list) else [jv] * len(rems)
+    jo = jo if isinstance(jo, list) else [jo] * len(rems)
     rows = [dict(layer=k, block=b, c=512, table_bits=23, ao_rem_bits=rem,
                  attn_out_bits=w, ao_acc_bits=a,
-                 ao_jv_max=(-6 if a else None), ao_jo_min=(-10 if a else None))
-            for k, (rem, w, a) in enumerate(zip(rems, bits, acc))]
+                 ao_jv_max=(v if a else None), ao_jo_min=(o if a else None))
+            for k, (rem, w, a, v, o) in enumerate(zip(rems, bits, acc, jv, jo))]
     with open(os.path.join(d, f"shapes_B{b}.json"), "w") as f:
         json.dump(dict(rows=rows, block=b), f)
 
@@ -696,6 +711,17 @@ def selftest():
         case("two head dumps of one prefix are one shape", ok,
              f"{len(hl)} head chunks, {len(el)} emit shapes")
 
+        # 8b. the attention output's form is part of the emit key: a block whose
+        #     layer 2 needs the product form (a 22-bit accumulator under a 9-bit
+        #     exponent window, the table of contents of PR #36) beside offset-form
+        #     layers at the same (c, table bits) is two shapes, not one
+        _shape_table(d, 0, [14, 15, 19], acc=[19, 19, 22], jv=-5, jo=-14)
+        _shape_table(d, 1, [14, 15, 19], acc=[19, 19, 19], jv=-5, jo=-14)
+        printed, refusal = _plan(args + ["--emit-out", em])
+        el = [l for l in open(em).read().splitlines() if not l.startswith("#")]
+        ok = refusal is None and len(el) == 2 and any(l.endswith("B0L2") for l in el)
+        case("a product-form layer is its own emit shape", ok, f"{len(el)} emit shapes")
+
         # ---- issue #121: the half no pin moves ---------------------------
         # 9. the recorded set: its rows carry no accumulator width, so the plan
         #    is written and says which half of the bound it could not check
@@ -717,13 +743,16 @@ def selftest():
         case("a re-extracted table is checked on both halves", ok, last(printed, refusal))
 
         # 11. and a shape whose window half does not fit: refused before the file
-        #    is written, and not by naming a pin, which cannot recover a bit of it
-        _shape_table(d, 1, [15, 16, 20], acc=[19, 19, 27])
+        #    is written, and not by naming a pin, which cannot recover a bit of it.
+        #    A 27-bit accumulator composes in the product form, so what is refused
+        #    here is an exponent window past even that one.
+        _shape_table(d, 1, [15, 16, 20], acc=[19, 19, 27], jv=[-6, -6, -5],
+                     jo=[-10, -10, -20])
         os.remove(out)
         printed, refusal = _plan(args)
         ok = (refusal is not None and refusal.startswith("block 1 layer 2: ")
               and "no-wrap window does not fit" in refusal
-              and "1 + 16 + 11 + 4 = 32 > 31 (over by 1, magnitude form)" in refusal
+              and "1 + max(16, 11) + 15 = 32 > 31 (over by 1, product form)" in refusal
               and "--ao-rem-per-line" not in refusal and not os.path.exists(out))
         case("a window half past the field is refused", ok, last(printed, refusal))
 
@@ -762,13 +791,14 @@ def selftest():
               and "--ao-rem-per-line" not in refusal and not os.path.exists(out))
         case("a head line past the quotient cap is refused", ok, last(printed, refusal))
 
-        # 14. and the half no pin moves: an accumulator one bit past the window
-        #     is refused too, naming neither pin, since neither could recover it
-        _head_dump(d, 1, 512, acc=27)
+        # 14. and the half no pin moves: an exponent window one bit past the
+        #     product form is refused too, naming neither pin, since neither
+        #     could recover it
+        _head_dump(d, 1, 512, acc=27, jv=-5, jo=-20)
         printed, refusal = _plan(args + head + pin23)
         ok = (refusal is not None and refusal.startswith("block 1's head line: ")
               and "no-wrap window does not fit" in refusal
-              and "1 + 16 + 11 + 4 = 32 > 31 (over by 1, magnitude form)" in refusal
+              and "1 + max(16, 11) + 15 = 32 > 31 (over by 1, product form)" in refusal
               and "--head-flags" not in refusal and not os.path.exists(out))
         case("a head line past the window half is refused", ok, last(printed, refusal))
 

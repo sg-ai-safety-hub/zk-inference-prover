@@ -134,6 +134,13 @@ def ao_no_wrap(acc_bits, jv_max, jo_min, attn_out_bits, rem_bits):
     `params_of` takes the magnitude form exactly when the offset form does not
     fit, so that every dump that composed before it existed keeps its columns.
 
+    The product form (`Params::ao_acc_prod`) is taken exactly when the
+    magnitude form does not fit either.  It range-checks `ahi num` slot by
+    slot, so the two limbs stop adding: the largest `|acc|` and the largest
+    exponent are a chunk-wide pair that no slot holds, and what has to fit is
+    `1 + max(lo, hi) + e_hi <= 31`.  Its soundness argument is
+    `prover/src/compose.rs`'s, beside the field.
+
     The sibling bound of the same identity is `ao_quotient` above, and it is the
     half a plan's pins move.
 
@@ -146,12 +153,13 @@ def ao_no_wrap(acc_bits, jv_max, jo_min, attn_out_bits, rem_bits):
     lo_off, hi_off = ao_acc_split(acc_bits + 1)
     lo_mag, hi_mag = ao_acc_split(acc_bits)
     mag = 1 + lo_off + hi_off + e_hi > NO_WRAP_BITS
+    prod = 1 + lo_mag + hi_mag + e_hi > NO_WRAP_BITS
     lo, hi = (lo_mag, hi_mag) if mag else (lo_off, hi_off)
-    bits = 1 + lo + hi + e_hi
+    bits = 1 + (max(lo, hi) if prod else lo + hi) + e_hi
     return dict(
         bits=bits, limit=NO_WRAP_BITS, margin=NO_WRAP_BITS - bits,
         acc_bits=acc_bits, acc_lo_bits=lo, acc_hi_bits=hi, e_hi=e_hi,
-        form="magnitude" if mag else "offset",
+        form="product" if prod else "magnitude" if mag else "offset",
         quotient=ao_quotient(attn_out_bits, rem_bits),
     )
 
@@ -170,19 +178,18 @@ def ao_quotient_refusal(q, where):
 def ao_no_wrap_refusal(w, where):
     """What `where`'s window is refused with, or `None` if it fits.
 
-    The message carries the numbers, because there is nothing to widen: the two
-    limbs must together cover `|acc|` however many of them there are, and `e_hi`
-    is the exponent table's own domain, so what is left is a narrower shape.
+    The message carries the numbers.  Only the product form can be refused
+    here, since it is taken whenever the other two do not fit, and what it asks
+    is that each limb times `2^e_hi` fits on its own: what is left is a
+    narrower exponent window or a narrower high limb.
     """
     if w["margin"] < 0:
         return (f"{where}: the attention output's no-wrap window does not fit: "
-                f"1 + {w['acc_lo_bits']} + {w['acc_hi_bits']} + {w['e_hi']} = {w['bits']} "
-                f"> {w['limit']} (over by {-w['margin']}, {w['form']} form). The two limbs "
-                f"must together cover |acc| ({w['acc_bits']} bits) and the exponent window "
-                f"must cover e = jv - jo, so no wider decomposition of either recovers a "
-                f"bit, and the one bit the magnitude form is worth is already taken. What "
-                f"is left is a narrower context or a quantization whose accumulator is "
-                f"narrower.")
+                f"1 + max({w['acc_lo_bits']}, {w['acc_hi_bits']}) + {w['e_hi']} = "
+                f"{w['bits']} > {w['limit']} (over by {-w['margin']}, {w['form']} form). "
+                f"Each limb of |acc| ({w['acc_bits']} bits) times 2^e_hi, with "
+                f"e_hi = jv_max - jo_min, has to stay under the field. What is left is a "
+                f"narrower exponent window or a narrower high limb.")
     return ao_quotient_refusal(w["quotient"], where)
 
 
@@ -452,7 +459,9 @@ def ao_head_report(r, q):
     `7 + 23 = 30` is the plain form's cap exactly.
     """
     w = q["window"]
-    half = (f"the no-wrap window is 1 + {w['acc_lo_bits']} + {w['acc_hi_bits']} + "
+    limbs = (f"max({w['acc_lo_bits']}, {w['acc_hi_bits']})" if w and w["form"] == "product"
+             else f"{w['acc_lo_bits']} + {w['acc_hi_bits']}" if w else "")
+    half = (f"the no-wrap window is 1 + {limbs} + "
             f"{w['e_hi']} = {w['bits']}/{w['limit']} bits, margin {w['margin']} "
             f"({w['form']} form)" if w else
             "the no-wrap window half is NOT CHECKED -- this head dump states no "
@@ -635,19 +644,28 @@ def selftest():
           and "NOT CHECKED" not in got and "25/31 bits, margin 6 (offset form)" in got)
     case("a re-extracted set is checked on both halves", ok, got)
 
-    # and the layer the window half exists for: an accumulator one bit past it.
-    # No pin moves the window, so the refusal names neither the pin nor
-    # `--ao-rem-per-line`, which could not recover a bit of it.
+    # an accumulator one bit past the magnitude form's window composes in the
+    # product form, which bounds `mag num` slot by slot
     rows[-1] = _row(2, 20, block=1, acc=27)
+    worst_of(rows)
+    w = ao_row_window(rows[-1], 20)
+    ok = w["form"] == "product" and w["bits"] == 21 and w["margin"] == 10
+    case("an accumulator past the magnitude form, in the product", ok,
+         f"{w['bits']}/{w['limit']} margin {w['margin']} ({w['form']} form)")
+
+    # and the layer the window half exists for: an exponent window past even
+    # the product form.  No pin moves it, so the refusal names neither the pin
+    # nor `--ao-rem-per-line`, which could not recover a bit of it.
+    rows[-1] = _row(2, 20, block=1, acc=27, jv=-5, jo=-20)
     try:
         worst_of(rows)
         got = "NOT refused"
     except AssertionError as e:
         got = str(e).splitlines()[0]
     ok = (got.startswith("block 1 layer 2: ") and "no-wrap window does not fit" in got
-          and "1 + 16 + 11 + 4 = 32 > 31 (over by 1, magnitude form)" in got
+          and "1 + max(16, 11) + 15 = 32 > 31 (over by 1, product form)" in got
           and "--ao-rem-per-line" not in got)
-    case("an accumulator past the window half is refused", ok, got.split(".")[0])
+    case("an exponent window past the product form is refused", ok, got.split(".")[0])
 
     # a set half re-extracted: the rows that state it are checked, the rest are
     # counted, and the pin is taken over all of them either way

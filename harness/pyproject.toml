@@ -56,5 +56,5 @@ packages = [
 ]
 
 [tool.setuptools.package-data]
-"harness.witness" = ["text.txt"]
+"harness.witness" = ["text.txt", "fixtures/*.json"]
 "harness.costmodel" = ["key_tile_segments.json"]

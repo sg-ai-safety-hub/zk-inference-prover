@@ -831,7 +831,7 @@ pub(crate) mod tests {
             round: "away".into(), ao_target: 16, ao_q_bits: 7, ao_rem_bits: 8,
             ao_jv_min: -8, ao_jv_max: -6, ao_jo_min: -10, ao_jo_max: -10,
             ao_acc_lo_bits: 16, ao_acc_hi_bits: 4,
-            ao_acc_mag: false, ao_denp2: false,
+            ao_acc_mag: false, ao_acc_prod: false, ao_denp2: false,
             fold_rem_bits: 0, fold_alpha: 0, freivalds_p: 136,
             residual_stream: Some(crate::compose::ResidualStreamParams {
                 d: 64, a: 4, dff: 64, head_norm: false,
@@ -917,7 +917,7 @@ pub(crate) mod tests {
             // only have to satisfy `Plan::new`'s asserts
             ao_jv_min: -8, ao_jv_max: -6, ao_jo_min: -10, ao_jo_max: -10,
             ao_acc_lo_bits: 16, ao_acc_hi_bits: 4,
-            ao_acc_mag: false, ao_denp2: false,
+            ao_acc_mag: false, ao_acc_prod: false, ao_denp2: false,
             fold_rem_bits: 0, fold_alpha: 0, freivalds_p: 136,
             residual_stream: Some(crate::compose::ResidualStreamParams {
                 d: 128, a: 4, dff: 128, head_norm: false,

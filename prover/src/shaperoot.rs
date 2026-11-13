@@ -611,6 +611,7 @@ mod tests {
             ("diagonal_block", Params { diagonal_block: true, ..params() }),
             ("kv_boundary", Params { kv_boundary: true, ..params() }),
             ("ao_acc_mag", Params { ao_acc_mag: true, ..params() }),
+            ("ao_acc_prod", Params { ao_acc_mag: true, ao_acc_prod: true, ..params() }),
         ];
         for (name, p) in moves {
             let k = key(&inputs(&p, &calibration()));

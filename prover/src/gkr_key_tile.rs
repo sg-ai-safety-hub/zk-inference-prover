@@ -571,7 +571,7 @@ pub fn ao_site(
         mut_env: "ZK_MUT_ATTNOUT",
         mut_key: 0,
         log_rows: r.lay.log_rows,
-        unit: vec![true; 7 * r.lay.per_row],
+        unit: vec![true; r.looks_per_slot() * r.lay.per_row],
         pre: &r.pre,
         base: &r.base,
         #[cfg(feature = "cuda")]
@@ -1983,7 +1983,8 @@ pub fn sites_of(plan: &crate::compose::Plan) -> Vec<Site> {
             log_rows: plan.ao_lay.log_rows,
             // stream JJ (E11): seven per slot -- the exponent window, (qm, nz2),
             // `d`, `dp`, `denp` and the accumulator's two limbs
-            unit: vec![true; 7 * plan.ao_lay.per_row],
+            unit: vec![true; crate::gadgets::attn_out::trace::slot_looks(plan.p.ao_acc_prod)
+                             * plan.ao_lay.per_row],
         });
     }
     out

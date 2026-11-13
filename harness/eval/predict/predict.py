@@ -519,9 +519,11 @@ def exact_segments(cfg, ctx, fields, seq=S, reductions=None, head_groups=None):
     Three things a `params` block needs that the fields file carries and the
     modal assumption does not, all of them the dump's own:
 
-      * `ao_acc_mag`, the attention output's accumulator form.  `params_of`
-        takes the magnitude form exactly when the offset window does not fit,
-        and that is a question about the segment's own accumulator;
+      * `ao_acc_mag` and `ao_acc_prod`, the attention output's accumulator
+        form.  `params_of` takes the magnitude form exactly when the offset
+        window does not fit, and the product form on top of it exactly when the
+        magnitude window does not fit either, and that is a question about the
+        segment's own accumulator and exponents;
       * the dequantize gadget each matmul is on (`deq_variants`).  A
         `b10-final` dump has every matmul on the chain; the 8B segments the cost
         model was read off were extracted at a spec that folds `v`, and the fold
@@ -562,7 +564,8 @@ def exact_segments(cfg, ctx, fields, seq=S, reductions=None, head_groups=None):
                 f"not in the file is not counted at another layer's. A layer the "
                 f"extractor refused belongs in the file's `absent` list, which "
                 f"`witness_fields --absent` writes.")
-        w = dict(wf.witness_block(row), ao_acc_mag=row["ao_acc_mag"])
+        w = dict(wf.witness_block(row), ao_acc_mag=row["ao_acc_mag"],
+                 ao_acc_prod=row.get("ao_acc_prod", False))
         p = ec.segment_params("first" if k == 0 else "layer", d=d, nh=nh, nkv=nkv,
                               hd=hd, dff=dff, vocab=vocab, s=seq, c=ctx,
                               witness=w, gkr=red, head_groups=hg)
@@ -665,6 +668,7 @@ def recorded_8b_fields(ctx):
         rows[str(int(p["segment"].split("L")[1]))] = dict(
             {f: q[f] for f in wf.WITNESS_FIELDS}, c=q["c"],
             ao_acc_mag=bool(q.get("ao_acc_mag", False)),
+            ao_acc_prod=bool(q.get("ao_acc_prod", False)),
             deq_variants={m["name"]: m["variant"] for m in q["mats"]},
             dump_sha256=None)
     hg = sorted({tuple(p["params"]["head_groups"])
@@ -1456,6 +1460,7 @@ def witness_fields_record(fields, path):
            dict(synthetic=True, stated_from=fields["stated_from"])),
         summary=fields.get("summary"),
         layers={k: dict(wf.witness_block(r), ao_acc_mag=r["ao_acc_mag"],
+                        ao_acc_prod=r.get("ao_acc_prod", False),
                         deq_variants=dict(r["deq_variants"]),
                         dump_sha256=r.get("dump_sha256"))
                 for k, r in sorted(rows.items())},
