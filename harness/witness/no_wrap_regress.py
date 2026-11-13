@@ -17,10 +17,11 @@ form (`prover/src/compose.rs`, `Params::ao_acc_prod`) bounds that product slot
 by slot, and this checks that the extraction now goes through in it, while
 the second prompt, prose, keeps the form it always had.
 
-It needs the model: `ZK_MODEL` naming a Llama 3.1 8B checkpoint (layers 0 and 1
-are all it reads, so a checkpoint truncated to two or more layers gives the
-same dumps).  Without one it says so and exits 0, the way the CPU selftests
-treat a card they do not have.
+It needs the model: `ZK_MODEL` naming a Llama 3.1 8B checkpoint, as a local
+directory or as a hub id already in the local cache (layers 0 and 1 are all it
+reads, so a checkpoint truncated to two or more layers gives the same dumps).
+Without one it says so and exits 0, the way the CPU selftests treat a card they
+do not have, and deciding that downloads nothing.
 
     ZK_MODEL=<llama 3.1 8b> uv run python -m harness.witness.no_wrap_regress
 """
@@ -38,14 +39,41 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = os.path.join(HERE, "fixtures", "no_wrap_prompts.json")
 
 
-def is_llama31_8b(path):
-    """Whether `path` is a Llama 3.1 8B checkpoint, by its config alone."""
-    try:
-        c = json.load(open(os.path.join(path, "config.json")))
-    except OSError:
-        return False
-    return (c.get("model_type") == "llama" and c.get("hidden_size") == 4096
-            and c.get("num_attention_heads") == 32 and c.get("vocab_size") == 128256)
+def not_llama31_8b(model):
+    """Why `model` is not a Llama 3.1 8B checkpoint, by its config alone, or
+    `None` if it is one.
+
+    `model` is `ZK_MODEL`, which `extract.py`'s `Model` hands to
+    `from_pretrained`: a local directory or a hub id.  A directory's
+    `config.json` is read as it is; a hub id is resolved the way `Model` would
+    resolve it, but from the local cache only (`local_files_only`, as
+    `eval/selftest.py`'s CPU path does), so a run that skips downloads nothing.
+    """
+    if not model:
+        return "ZK_MODEL is not set"
+    if os.path.isdir(model):
+        try:
+            with open(os.path.join(model, "config.json")) as f:
+                c = json.load(f)
+        except OSError as e:
+            return f"no config.json in that directory ({type(e).__name__})"
+        except ValueError as e:
+            return f"its config.json does not parse ({e})"
+    else:
+        from transformers import AutoConfig
+        try:
+            c = AutoConfig.from_pretrained(model, local_files_only=True).to_dict()
+        except Exception as e:             # any of: not cached, not a hub id, unreadable
+            return (f"not a directory, and no config for it in the local cache "
+                    f"({type(e).__name__})")
+    if not isinstance(c, dict):
+        return "its config.json is not an object"
+    if not (c.get("model_type") == "llama" and c.get("hidden_size") == 4096
+            and c.get("num_attention_heads") == 32 and c.get("vocab_size") == 128256):
+        return (f"its config is a {c.get('model_type')!r} of hidden size "
+                f"{c.get('hidden_size')}, {c.get('num_attention_heads')} heads and a "
+                f"vocabulary of {c.get('vocab_size')}")
+    return None
 
 
 def window_of(ids, tmp):
@@ -66,9 +94,11 @@ def window_of(ids, tmp):
 
 def main():
     model = os.environ.get("ZK_MODEL", "")
-    if not is_llama31_8b(model):
-        print(f"SKIP  no Llama 3.1 8B checkpoint at ZK_MODEL={model!r}; the window "
-              f"arithmetic on these prompts' numbers is in `extract.py --selftest`")
+    why = not_llama31_8b(model)
+    if why:
+        print(f"SKIP  no Llama 3.1 8B checkpoint at ZK_MODEL={model!r}: {why}. The "
+              f"window arithmetic on these prompts' numbers is in "
+              f"`extract.py --selftest`")
         return 0
     prompts = {p["name"]: p["ids"] for p in json.load(open(FIXTURE))["prompts"]}
     bad = 0

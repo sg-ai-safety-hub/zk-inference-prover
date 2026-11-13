@@ -564,7 +564,8 @@ def no_wrap_selftest():
         ("one bit past the magnitude form, in the product form",
          (27, -6, -10, 8, 8), 21, 10, "product", 15, 15, "plain"),
         # the Llama 3.1 8B dump this form was written for: block 0 layer 1 of a
-        # 512-token table of contents (`tests/fixtures/toc_512.json`), whose
+        # 512-token table of contents (`table_of_contents` in
+        # `harness/witness/fixtures/no_wrap_prompts.json`), whose
         # 22-bit accumulator the magnitude form refused at `1 + 16 + 6 + 9 = 32`
         # (the window's three numbers are that dump's; the quotient's two are the
         # synthetic shape's, since that half is the pin's and not this form's)
